@@ -4,8 +4,10 @@ version = "0.1.0"
 description = "Local-first speech recognition for subtitles, dictation and meeting notes"
 readme = "README.md"
 authors = [
-    { name = "BMProjects", email = "brant.mar@gmail.com" }
+    { name = "BMProjects", email = "8133185+BMProjects@users.noreply.github.com" }
 ]
+license = "MIT"
+license-files = ["LICENSE"]
 # 3.11 is the floor because of `tomllib`; nothing in the tree needs more. The ceiling
 # matters more than the floor here: JetPack 7 / Ubuntu 24.04 ships Python 3.12, so a
 # >=3.13 requirement made the node uninstallable on the very device it targets.

@@ -217,5 +217,6 @@ This is an assembly of other people's work far more than it is original:
 
 ## License
 
-Not yet chosen — see the repository for the current state. Model weights carry their own
-licences from their respective publishers.
+[MIT](LICENSE). Model weights are not covered by it — each carries its own licence from
+its publisher, and those are the terms that govern what you may do with the models
+themselves.
