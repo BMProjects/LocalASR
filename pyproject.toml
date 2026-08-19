@@ -1,0 +1,65 @@
+[project]
+name = "localasr"
+version = "0.1.0"
+description = "Local-first speech recognition for subtitles, dictation and meeting notes"
+readme = "README.md"
+authors = [
+    { name = "BMProjects", email = "brant.mar@gmail.com" }
+]
+# 3.11 is the floor because of `tomllib`; nothing in the tree needs more. The ceiling
+# matters more than the floor here: JetPack 7 / Ubuntu 24.04 ships Python 3.12, so a
+# >=3.13 requirement made the node uninstallable on the very device it targets.
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.1",
+    "httpx>=0.28",
+    "typer>=0.15",
+]
+
+[project.optional-dependencies]
+# Audio capture and VAD. Needed wherever a microphone is, which is the desktop — the
+# compute node has no sound devices at all and must not be made to build these.
+capture = [
+    "onnxruntime>=1.20",
+    "sounddevice>=0.5.1",
+    "soxr>=1.1.0",
+]
+# The compute node: serves ASR and refinement over HTTP, holds no audio stack.
+node = [
+    "fastapi>=0.115",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.34",
+]
+align = ["torch>=2.6", "transformers>=5.13"]
+gui = ["localasr[capture]", "PySide6>=6.11"]
+
+[project.scripts]
+localasr = "localasr.frontends.cli.main:app"
+localasr-desktop = "localasr.frontends.desktop.app:main"
+localasr-node = "localasr.node.server:main"
+localasr-refiner = "localasr.refine.host:main"
+
+[dependency-groups]
+# Installed by default, so plain `uv run pytest` still exercises the audio path and the
+# GUI on a development machine. The compute node installs with `--no-dev`, which is what
+# keeps PySide6, onnxruntime, soxr and sounddevice off the Jetson:
+#     uv sync --no-dev --extra node
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+    "localasr[capture,gui,node]",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

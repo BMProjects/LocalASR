@@ -1,0 +1,142 @@
+# Declarative model catalog.
+#
+# Adding a model the runtime already supports is a config change, not a code change.
+# `runtime` selects which supervisor launches it; `llama-server` covers the audio
+# models in llama.cpp's multimodal support.
+#
+# Every file is pinned by repository revision, sha256 and size, and downloads are
+# verified before use. `resolve/main` is a moving target: the same URL can serve a
+# different graph after an upstream push, which for a VAD or an ASR model changes
+# results silently rather than failing. Files land in
+# models/<model_id>/<revision>/<filename> so two models can share a filename.
+#
+# Resource cost is deliberately absent here — it depends on hardware, driver, backend
+# and launch flags, so it belongs to a per-machine profile (see profile.py), not to a
+# catalog shared across machines.
+
+[runtime.llama-server]
+# llama.cpp's audio support is upstream-flagged as experimental, so the builds whose
+# behaviour has actually been exercised are listed rather than assumed. Anything not
+# here still runs; it only warns.
+#
+#   b10333  the x86_64 Vulkan release the desktop uses
+#   b300    built from commit 153d324bcf86d220b235ca010eeb11213f32b5d1 on the Jetson
+#           Orin Nano Super (CUDA sm87) and measured there with Qwen3.5-4B
+#
+# One list, not a verified build plus a commit nobody reads: the second was decoration,
+# and the machine it described was warning about a mismatch on every start.
+verified_builds = ["b10333", "b300"]
+release_url = "https://github.com/ggml-org/llama.cpp/releases"
+
+[models.qwen3-asr-1_7b-q8]
+# 3964 MiB measured on the Orin, headless, cold page cache (weights 2403 MiB, 1.65x).
+# The 1.4x fallback would have under-counted this by 600 MiB, which is the whole margin
+# on an 8 GB board — the reason measured values beat any single multiplier.
+# 3964 MiB measured alone on an idle machine with a cold page cache; 3791 MiB when
+# loaded second, beside an already-running refiner. The larger figure is kept because a
+# guard that under-counts is the expensive kind of wrong — but note that summing two
+# such figures over-states a pair by ~170 MiB, since some cost (CUDA context, shared
+# library pages) is paid once rather than twice.
+measured_mb = 3964
+runtime = "llama-server"
+repo = "ggml-org/Qwen3-ASR-1.7B-GGUF"
+revision = "36a678687ba7d07a74ca70ccb0e36902e005fb80"
+ctx_size = 4096
+default = true
+
+[models.qwen3-asr-1_7b-q8.files.model]
+name = "Qwen3-ASR-1.7B-Q8_0.gguf"
+sha256 = "58e22d0532d4eacaf034cfac17a6fed159f37c41390c710186783be439d1fc57"
+size = 2165034944
+
+[models.qwen3-asr-1_7b-q8.files.mmproj]
+name = "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"
+sha256 = "46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d"
+size = 355709344
+
+[models.qwen3-asr-0_6b-q8]
+# 2401 MiB measured on the Orin, headless, cold page cache (weights 971 MiB, 2.47x).
+# An earlier reading of 1551 was taken while the desktop session was up and another
+# model was already resident; under that pressure the kernel simply had less to hand
+# back, and the number flattered the model. Measure on an idle machine or not at all.
+measured_mb = 2401
+runtime = "llama-server"
+repo = "ggml-org/Qwen3-ASR-0.6B-GGUF"
+revision = "928ab958557df9aa2ef1c93e0e83c7ad0933fae2"
+ctx_size = 4096
+default = false
+
+[models.qwen3-asr-0_6b-q8.files.model]
+name = "Qwen3-ASR-0.6B-Q8_0.gguf"
+sha256 = "bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971"
+size = 804749248
+
+[models.qwen3-asr-0_6b-q8.files.mmproj]
+name = "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"
+sha256 = "41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d"
+size = 214392480
+
+# Pinned to a commit rather than master: upstream released v6.2.1 while master keeps
+# moving, and the post-processing in vad.py is a port of this exact revision.
+[vad]
+repo = "snakers4/silero-vad"
+revision = "76e3dc408eb2a5c655c34e230d2d5459b4439daa"
+url = "https://raw.githubusercontent.com/snakers4/silero-vad/{revision}/src/silero_vad/data/silero_vad.onnx"
+name = "silero_vad.onnx"
+sha256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+size = 2327524
+
+# --- refinement (kind = "llm") ------------------------------------------------
+#
+# A second role, not a second ASR model: this one tidies transcripts and never sees
+# audio. It is listed here so it inherits the same pinning discipline — revision,
+# sha256 and size — as everything else.
+#
+# Q4_K_M rather than the official repo's Q8_0 (1.83 GB): on 8 GB of *unified* memory
+# the refiner shares a pool with the ASR model, the desktop and the page cache, so the
+# 0.7 GB saved is the difference between sequential loading being comfortable and being
+# a swap storm. The quantisation comes from unsloth because the official GGUF repo
+# publishes Q8_0 only; pinning the revision and hash is what makes that acceptable.
+
+# Qwen3.5-4B is the model to try, per the current plan. The unsloth quantisation is
+# listed rather than bartowski's because it is 260 MiB smaller for the same Q4_K_M
+# recipe, and on a device where the guard is the binding constraint that difference is
+# the whole margin. No `mmproj`: refinement only ever sees text.
+#
+# Read the memory note below before assuming this one loads.
+[models.qwen3_5-4b-refiner-q4]
+# 3876 MiB measured on the Orin at -c 4096, headless, cold page cache
+# (weights 2613 MiB, 1.48x). An earlier 3365 came from a loaded machine; see the note
+# on the 0.6B entry.
+measured_mb = 3876
+runtime = "llama-server"
+kind = "llm"
+repo = "unsloth/Qwen3.5-4B-GGUF"
+revision = "e87f176479d0855a907a41277aca2f8ee7a09523"
+ctx_size = 4096
+default = true
+
+[models.qwen3_5-4b-refiner-q4.files.model]
+name = "Qwen3.5-4B-Q4_K_M.gguf"
+sha256 = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+size = 2740937888
+
+
+# The refiner that lets both roles stay resident. 2108 MiB measured on the Orin,
+# headless, cold page cache (weights 1221 MiB, 1.73x) against the 4B's 3876 — and
+# 1.7B ASR + 2B refiner is 5899 MiB, which fits the 6903 MiB headless budget with room
+# to spare. unsloth's quantisation is 115 MiB smaller than bartowski's for the same
+# Q4_K_M recipe. No mmproj: refinement only ever sees text.
+[models.qwen3_5-2b-refiner-q4]
+measured_mb = 2108
+runtime = "llama-server"
+kind = "llm"
+repo = "unsloth/Qwen3.5-2B-GGUF"
+revision = "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+ctx_size = 4096
+default = false
+
+[models.qwen3_5-2b-refiner-q4.files.model]
+name = "Qwen3.5-2B-Q4_K_M.gguf"
+sha256 = "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223"
+size = 1280835840

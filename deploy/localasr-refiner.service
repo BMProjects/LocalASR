@@ -1,0 +1,25 @@
+[Unit]
+Description=LocalASR refinement model host
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Dev/LocalASR
+ExecStart=%h/.local/bin/uv run localasr-refiner
+# A fixed port, because refiner_url in config.toml has to keep pointing somewhere.
+Environment=LOCALASR_REFINER_PORT=8091
+# Loopback by default. Change to 0.0.0.0 only together with LOCALASR_REFINER_TOKEN in
+# the environment file below — the host refuses to serve an unauthenticated model on
+# the network, and llama-server has no access control of its own.
+Environment=LOCALASR_REFINER_BIND=127.0.0.1
+Environment=LOCALASR_DATA_DIR=%h/Dev/LocalASR
+# Optional: token, LOCALASR_LLAMA_DIR, LOCALASR_DEVICE. Absent file is not an error.
+EnvironmentFile=-%h/.config/localasr-refiner.env
+Restart=on-failure
+RestartSec=5
+# A cold load runs to tens of seconds; killing it mid-load leaves a llama-server holding
+# memory that nothing will reclaim.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

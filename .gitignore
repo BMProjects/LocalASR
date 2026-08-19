@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Large local assets: model weights and vendored runtime binaries
+models/
+vendor/
+
+# Machine-local state, not project source.
+# `imported.toml` records absolute paths into whichever model store this machine uses;
+# the logs are runtime output. Both differ per machine and neither belongs in history.
+imported.toml
+*.log
+
+# Recordings. Voice is personal data even when the words are not, and these are
+# somebody's actual speech — kept out of the repository on purpose.
+samples/
+
+# Local scratch
+.remember/
+*.srt
+*.vtt
+
+# The original Chinese engineering notebook: machine-specific paths and
+# measurements, kept locally rather than published.
+docs/notes-zh.md

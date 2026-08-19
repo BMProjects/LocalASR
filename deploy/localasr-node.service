@@ -1,0 +1,28 @@
+[Unit]
+Description=LocalASR compute node
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Dev/LocalASR
+# --no-dev on the run, not just the sync: the dev group pulls localasr[capture,gui,node]
+# so `uv run pytest` works on a development machine, and a bare `uv run` here would
+# quietly install PySide6 and onnxruntime onto a headless Jetson.
+ExecStart=%h/.local/bin/uv run --no-dev --python 3.12 localasr-node
+Environment=LOCALASR_NODE_BIND=0.0.0.0
+Environment=LOCALASR_NODE_PORT=8090
+Environment=LOCALASR_DATA_DIR=%h/Dev/LocalASR
+Environment=LOCALASR_LLAMA_DIR=%h/Dev/llama.cpp/build/bin
+# No co-residency switch any more. Loading one role never unloads the other, and a load
+# that does not fit is refused with the resident model named rather than silently
+# evicting it. Measured on the Orin: the two models leave 1002 MiB at load and 696 MiB
+# warm, so a desktop session on the same board (~340 MiB more) is tight but works.
+EnvironmentFile=%h/.config/localasr-node.env
+Restart=on-failure
+RestartSec=5
+# Models are loaded on demand and a load can take ~40 s on a Jetson; killing the
+# process mid-load leaves a llama-server holding memory nothing will reclaim.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
