@@ -340,7 +340,20 @@ class AppContext:
         return SileroVad(manager.vad_path(), config)
 
     def require_model_available(self) -> None:
-        """Refuse a hidden multi-gigabyte download after live capture has started."""
+        """Refuse a hidden multi-gigabyte download after live capture has started.
+
+        Only meaningful when recognition would run *here*. With a node configured the
+        weights on this disk are not what gets used: the engine attaches to the node and
+        only ever launches locally as a fallback, which fails with its own message.
+
+        Asking the disk regardless is how a working desktop came to refuse to record.
+        Once the local copies were deleted on purpose — recognition having moved to the
+        node — the backend panel correctly showed the node ready while 开始识别 answered
+        「识别模型尚未准备好」 and named a path that machine has no reason to hold. Two
+        checks, one question, opposite answers.
+        """
+        if self.node_url:
+            return
         if manager.is_downloaded(self.spec):
             return
         raise RuntimeError(

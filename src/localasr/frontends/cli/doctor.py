@@ -22,9 +22,52 @@ class Check:
     required_by: tuple[str, ...]
 
 
+def _recognition_check(apps: tuple[str, ...]) -> Check:
+    """Whether recognition can happen — not whether a file is on this disk.
+
+    With a node configured the weights here are never used, so asking the disk reported
+    all three applications as 未就绪 on a machine that worked perfectly: the local copies
+    had been deleted precisely because recognition moved to the node. Doctor exists to
+    say whether the thing will run, so it has to look where it actually runs.
+    """
+    from localasr.context import Settings
+    from localasr.registry import manager
+
+    settings = Settings.load()
+    node_url = settings.node_url or os.environ.get("LOCALASR_NODE_URL")
+    if node_url:
+        import httpx
+
+        headers = {}
+        token = settings.node_token or os.environ.get("LOCALASR_NODE_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            with httpx.Client(timeout=3.0) as client:
+                if client.get(f"{node_url}/healthz").status_code != 200:
+                    return Check("recognition node", False, f"{node_url} 未回应健康检查", apps)
+                ready = client.get(f"{node_url}/readyz", headers=headers)
+            body = ready.json() if ready.status_code in (200, 503) else {}
+            loaded = body.get("loaded", {}).get("asr")
+        except (httpx.HTTPError, ValueError) as exc:
+            detail = f"{node_url} 不可达（{type(exc).__name__}）"
+            return Check("recognition node", False, detail, apps)
+        # 503 is not a fault: the node loads on demand and has simply not been asked yet.
+        detail = f"{node_url} · {loaded} 已驻留" if loaded else f"{node_url} · 首次识别时加载"
+        return Check("recognition node", True, detail, apps)
+
+    spec = manager.get_model()
+    downloaded = manager.is_downloaded(spec)
+    return Check(
+        f"model {spec.model_id}",
+        downloaded,
+        f"{manager.model_dir(spec)}" if downloaded else "localasr models pull",
+        apps,
+    )
+
+
 def _engine_checks() -> list[Check]:
     from localasr.core.engine.supervisor import SupervisorError, check_build, find_llama_server
-    from localasr.registry import manager
 
     checks: list[Check] = []
     apps = ("subtitle", "dictate", "meeting")
@@ -40,16 +83,7 @@ def _engine_checks() -> list[Check]:
     except SupervisorError as exc:
         checks.append(Check("llama-server", False, str(exc), apps))
 
-    spec = manager.get_model()
-    downloaded = manager.is_downloaded(spec)
-    checks.append(
-        Check(
-            f"model {spec.model_id}",
-            downloaded,
-            f"{manager.model_dir(spec)}" if downloaded else "localasr models pull",
-            apps,
-        )
-    )
+    checks.append(_recognition_check(apps))
 
     ffmpeg = shutil.which("ffmpeg")
     checks.append(Check("ffmpeg", bool(ffmpeg), ffmpeg or "sudo apt install ffmpeg", ("subtitle",)))

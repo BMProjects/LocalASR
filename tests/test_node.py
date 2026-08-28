@@ -723,7 +723,7 @@ def test_stopping_a_refiner_that_never_started_is_harmless() -> None:
     assert not context.refiner_loaded
 
 
-def test_a_refiner_that_cannot_start_reports_the_module_s_reason() -> None:
+def test_a_refiner_that_cannot_start_reports_the_module_s_reason(monkeypatch) -> None:  # noqa: ANN001
     """The check for a usable model now lives in the module, not here.
 
     That is the point of the split — but it means the parent has to carry the child's
@@ -733,10 +733,16 @@ def test_a_refiner_that_cannot_start_reports_the_module_s_reason() -> None:
     """
     from localasr.context import AppContext
     from localasr.core.engine.supervisor import SupervisorError
+    from localasr.refine import host
 
     context = AppContext()
     context.settings.refiner_url = None
     context.settings.refiner_model_id = "a-model-that-does-not-exist"
+
+    # Force the spawn path. A companion that finds the port already answering adopts it
+    # instead — correct behaviour, and it made this test fail whenever the author's own
+    # application happened to be running, which is not a property of the code under test.
+    monkeypatch.setattr(host.Companion, "_answers", lambda _self: False)
 
     with pytest.raises(SupervisorError) as caught:
         context.start_refiner()
@@ -831,3 +837,84 @@ def test_a_start_failure_says_why_not_just_the_exit_code(tmp_path) -> None:  # n
 
     assert "未捕获日志" in _why_it_died(None)
     assert "未捕获日志" in _why_it_died(tmp_path / "absent.log")
+
+
+def test_a_desktop_that_recognises_remotely_needs_no_local_weights(monkeypatch) -> None:  # noqa: ANN001
+    """The bug the status panel could not show, because the panel was right.
+
+    `require_model_available` asked whether the weights are on *this* disk. With a node
+    configured they are never used — the engine attaches to the node and only ever
+    launches locally as a fallback. So on a desktop whose local copies had been deleted
+    on purpose, the backend panel correctly showed the node ready while 开始识别 refused
+    with "识别模型尚未准备好", naming a path that machine has no reason to hold.
+    """
+    from localasr.context import AppContext
+    from localasr.registry import manager
+
+    monkeypatch.setattr(manager, "is_downloaded", lambda _spec: False)
+    context = AppContext()
+    context.settings.node_url = "http://asr-node.local:8090"
+
+    context.require_model_available()  # must not raise
+
+
+def test_without_a_node_the_local_weights_are_still_required(monkeypatch) -> None:  # noqa: ANN001
+    """The check still has a job: locally, starting to record and only then discovering
+    a 2.4 GB download is missing is exactly what it exists to prevent."""
+    from localasr.context import AppContext
+    from localasr.registry import manager
+
+    monkeypatch.setattr(manager, "is_downloaded", lambda _spec: False)
+    monkeypatch.delenv("LOCALASR_NODE_URL", raising=False)
+    context = AppContext()
+    context.settings.node_url = None
+
+    with pytest.raises(RuntimeError, match="尚未准备好"):
+        context.require_model_available()
+
+
+def test_doctor_checks_the_node_rather_than_this_machine_s_disk(monkeypatch) -> None:  # noqa: ANN001
+    """`localasr doctor` reported all three applications as 未就绪 on a machine that
+    worked, because it asked whether the ASR weights were on this disk. They had been
+    deleted on purpose when recognition moved to the node. README tells people to run
+    doctor first, so this was the first thing a working setup said about itself."""
+    import httpx
+
+    from localasr.context import Settings
+    from localasr.frontends.cli import doctor
+    from localasr.registry import manager
+
+    monkeypatch.setattr(manager, "is_downloaded", lambda _spec: False)
+    monkeypatch.setattr(
+        Settings, "load",
+        staticmethod(lambda: Settings(node_url="http://asr-node.local:8090")),
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(200, json={"loaded": {"asr": "qwen3-asr-1_7b-q8"}})
+
+    original = httpx.Client.__init__
+    monkeypatch.setattr(
+        httpx.Client, "__init__",
+        lambda self, *a, **k: original(self, *a, **{**k, "transport": httpx.MockTransport(handle)}),
+    )
+
+    check = doctor._recognition_check(("dictate",))
+    assert check.ok, "a reachable node means recognition works"
+    assert "qwen3-asr-1_7b-q8" in check.detail
+
+
+def test_doctor_still_wants_local_weights_when_there_is_no_node(monkeypatch) -> None:  # noqa: ANN001
+    from localasr.context import Settings
+    from localasr.frontends.cli import doctor
+    from localasr.registry import manager
+
+    monkeypatch.delenv("LOCALASR_NODE_URL", raising=False)
+    monkeypatch.setattr(manager, "is_downloaded", lambda _spec: False)
+    monkeypatch.setattr(Settings, "load", staticmethod(lambda: Settings(node_url=None)))
+
+    check = doctor._recognition_check(("dictate",))
+    assert not check.ok
+    assert "models pull" in check.detail
