@@ -126,6 +126,10 @@ class DictationWindow(ShellWindow):
         self._starting = False
         self._hidden_for_delivery = False
         self._refiner: _RefineThread | None = None
+        self._state = IDLE
+        """The last state shown. Enablement is computed from it in one place, so that
+        presentation and availability cannot drift apart — which they did: starting a
+        refinement disabled 开始识别 and finishing one never re-enabled it."""
 
         self.setObjectName("appSurface")
         self.setWindowTitle("LocalASR — 语音输入")
@@ -511,12 +515,31 @@ class DictationWindow(ShellWindow):
         """
         has_raw = bool(self.last_text.toPlainText().strip())
         has_refined = bool(self.refined_text.toPlainText().strip())
-        recognising = self._worker is not None or self.controller.recording
+        # One expression for "is recognition happening", used by every control below.
+        # The toggle used to answer it from `self._state` while everything else asked the
+        # controller, which is two sources of truth for one question — the shape of bug
+        # this method exists to prevent.
+        recognising = (
+            self._worker is not None
+            or self.controller.recording
+            or self._state in {RECORDING, TRANSCRIBING}
+        )
         refining = self._refiner is not None
 
         self.copy_button.setEnabled(has_raw)
         self.copy_refined_button.setEnabled(has_refined)
         self.save_refined_button.setEnabled(has_refined)
+
+        # 开始识别 belongs here too, not in `_show_state`. Split across the two, the two
+        # drifted: a refinement starting went through both and a refinement finishing
+        # through only this one, so the record button stayed grey for the rest of the
+        # session. PREPARING is the exception — the same button is the way out of a slow
+        # first load, so it stays live.
+        # PREPARING is the exception: the same button is the only way out of a slow first
+        # load, so it stays live while everything else waits.
+        preparing = self._state == PREPARING and not self._abort_requested
+        self.toggle_button.setEnabled(preparing or (not self._blocking() and not refining))
+        self.device_panel.set_enabled(not recognising and not refining)
 
         self.clear_button.setEnabled(has_raw and not recognising and not refining)
         self.refine_button.setEnabled(
@@ -542,6 +565,10 @@ class DictationWindow(ShellWindow):
             if refining
             else "清空左右两栏"
         )
+
+    def _blocking(self) -> bool:
+        """Work that pressing 开始识别 could not interrupt or usefully queue behind."""
+        return self._state == TRANSCRIBING or self._worker is not None
 
     def _clear_result(self) -> None:
         self.last_text.clear()
@@ -570,7 +597,6 @@ class DictationWindow(ShellWindow):
         self._refiner.done.connect(self._refined)
         self._refiner.finished.connect(self._refine_finished)
         self._refiner.start()
-        self._result_changed()
         self._show_state(self.controller.state)
 
     def _refined(self, result: object) -> None:
@@ -692,6 +718,8 @@ class DictationWindow(ShellWindow):
                 self.status_message.setText("文字已复制到剪贴板，请在目标应用中按 Ctrl+V。")
 
     def _show_state(self, state: str, detail: str | None = None) -> None:
+        """What the window says it is doing. Availability follows, via _result_changed."""
+        self._state = state
         label, tone, guidance = _STATE_COPY.get(state, (state, "neutral", ""))
         self.state_badge.setText(label)
         set_tone(self.state_badge, tone)
@@ -707,15 +735,11 @@ class DictationWindow(ShellWindow):
         # label alone is easy to misread at a glance while you are talking.
         stopping = preparing or state == RECORDING
         set_role(self.toggle_button, "stop" if stopping else "primary")
-        # Refining counts as busy for the same reason 清空 does: a new round of dictation
-        # appends to the transcript the model is currently working from.
-        busy = (
-            state == TRANSCRIBING
-            or (self._worker is not None and not preparing)
-            or self._refiner is not None
-        )
-        self.toggle_button.setEnabled(not busy)
-        self.device_panel.set_enabled(state not in {RECORDING, TRANSCRIBING} and not busy)
+        # Enablement is not decided here. This method is reached only when the state
+        # changes, and buttons also have to answer to things that change without one —
+        # a refinement ending, text being edited. One function owns that; this one owns
+        # what the window *says*.
+        self._result_changed()
 
     @staticmethod
     def _delivery_summary() -> str:

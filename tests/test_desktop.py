@@ -1631,3 +1631,41 @@ def test_nothing_to_do_when_no_input_method_is_configured() -> None:
     from localasr.frontends.desktop.app import fix_input_method
 
     assert fix_input_method({"WAYLAND_DISPLAY": "wayland-0"}) is None
+
+
+def test_recording_is_available_again_once_a_refinement_ends(qt_app):
+    """The mirror of an earlier bug, and introduced by its fix.
+
+    Enablement lived in two functions: `_result_changed` owned 清空/整理/复制, and
+    `_show_state` owned 开始识别. Starting a refinement called both; finishing one called
+    only the first, so the record button stayed grey for the rest of the session with
+    nothing left that would ever recompute it. Clearing the text afterwards looked like
+    the cause, because it was the last thing the user touched.
+    """
+    from localasr.refine.types import RefinementMode, RefinementResult
+
+    context = AppContext()
+    context.settings.node_url = "http://asr-node.local:8090"
+    bridge = QtEventBridge(context.bus)
+    window = DictationWindow(context, bridge, DictationController(context))
+    window.last_text.setPlainText("嗯那个我们下周一要交三个报告")
+
+    window._refiner = object()
+    window._result_changed()
+    window._show_state(window.controller.state)
+    assert not window.toggle_button.isEnabled(), "recording during a refinement is refused"
+
+    window._refined(
+        RefinementResult(
+            raw_text="嗯那个我们下周一要交三个报告",
+            refined_text="我们下周一要交三个报告。",
+            mode=RefinementMode.CONSERVATIVE,
+            source_segment_ids=(),
+        )
+    )
+    window._refine_finished()
+
+    assert window.toggle_button.isEnabled(), "nothing is running; recording must be possible"
+    window._clear_result()
+    assert window.toggle_button.isEnabled(), "clearing text has nothing to do with recording"
+    bridge.stop()
