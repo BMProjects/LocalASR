@@ -17,10 +17,17 @@ paths in this process, and survives a network blip mid-session; binding the serv
 process too recovers the remaining 4% and adds all three. So residency is the default and
 the service is opt-in, through `node_ssh`.
 
-**Nothing is released that this process did not cause.** A node that was already serving,
-with a model already resident, is left exactly as it was found — somebody else may be
-using it, and on a shared node "the last client to quit unloads your model" is a bad
-rule. Same `_owned` discipline as the refinement companion, for the same reason.
+**The session hands the model back when it ends.** That is the whole point, and getting
+it wrong is subtle: an earlier version released only a model it had loaded itself, on the
+reasoning that unloading somebody else's is rude. Sound in the abstract, and it made the
+feature never fire. The node loads on demand, so the model becomes resident the first
+time anyone transcribes; every launch after that finds it warm, adopts it, and releases
+nothing. 2.8 GB stayed held forever on an 8 GB board — the opposite of the point.
+
+So releasing on exit is the default, and `release_on_exit=False` restores the careful
+behaviour for a node that genuinely has more than one client. It is a deployment fact,
+not something a client can work out: the node has no notion of sessions, so "already
+resident" cannot distinguish "somebody is using this" from "I left it there yesterday".
 """
 
 from __future__ import annotations
@@ -47,13 +54,16 @@ class NodeCompanion:
         token: str | None = None,
         ssh: str | None = None,
         service: str = "localasr-node",
+        release_on_exit: bool = True,
     ) -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.ssh = ssh
         self.service = service
+        self.release_on_exit = release_on_exit
         self._loaded_model = False
-        """Whether *we* made the model resident. Only then may we release it."""
+        """Whether *we* made the model resident. The only thing released when
+        `release_on_exit` is off."""
         self._started_service = False
 
     @property
@@ -107,9 +117,10 @@ class NodeCompanion:
         return loaded
 
     def stop(self) -> None:
-        """Hand back exactly what was taken, and nothing else."""
-        if self._loaded_model:
-            self._loaded_model = False
+        """End the session: give the model back, and stop the service if we started it."""
+        releasing = self.release_on_exit or self._loaded_model
+        self._loaded_model = False
+        if releasing:
             try:
                 with httpx.Client(timeout=SERVICE_TIMEOUT) as client:
                     client.post(

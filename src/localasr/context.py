@@ -65,6 +65,14 @@ class Settings:
     way, is 2881. Set it only if you want the board completely idle between sessions.
     """
     node_service: str = "localasr-node"
+    node_release_on_exit: bool = True
+    """Whether quitting hands the node's ASR model back.
+
+    On by default: that is what binding residency to the session means, and 2881 MiB on
+    an 8 GB board is the reason it exists. Turn it off for a node with more than one
+    client, where the last client to quit should not unload a model somebody else is
+    mid-sentence with — the node has no notion of sessions, so only the deployment knows.
+    """
 
     refiner_url: str | None = None
     """Base URL of an OpenAI-compatible chat server for refinement, e.g. Unsloth Studio
@@ -238,6 +246,7 @@ class AppContext:
                 token=self.settings.node_token or os.environ.get("LOCALASR_NODE_TOKEN"),
                 ssh=self.settings.node_ssh,
                 service=self.settings.node_service,
+                release_on_exit=self.settings.node_release_on_exit,
             )
         return self._node.start()
 

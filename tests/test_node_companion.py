@@ -72,17 +72,14 @@ def test_a_session_loads_the_model_and_gives_it_back(node) -> None:  # noqa: ANN
     assert node.releases == [{"kind": "asr"}], "2881 MiB, measured — it must not be left held"
 
 
-def test_a_model_somebody_else_loaded_is_left_alone(node) -> None:  # noqa: ANN001
-    """The rule that makes a shared node usable. "The last client to quit unloads your
-    model" would make two people unable to use one board."""
+def test_a_warm_model_is_used_rather_than_loaded_again(node) -> None:  # noqa: ANN001
+    """Adoption is still right on the way in: reloading a resident model would cost
+    thirty seconds to arrive at the state already in front of us."""
     node.resident = "qwen3-asr-1_7b-q8"
     companion = NodeCompanion(URL)
 
-    companion.start()
+    assert "已驻留" in companion.start()
     assert node.loads == [], "it was already warm"
-
-    companion.stop()
-    assert node.releases == [], "and it was not ours to release"
 
 
 def test_a_token_becomes_a_bearer_header(node) -> None:  # noqa: ANN001
@@ -156,3 +153,43 @@ def test_starting_the_service_uses_systemd_rather_than_a_held_ssh_pipe(monkeypat
     assert seen[0][:3] == ["ssh", "-o", "BatchMode=yes"]
     assert seen[0][-3:] == ["--user", "start", "localasr-node"]
     assert not any("nohup" in part or part == "&" for part in seen[0])
+
+
+def test_a_model_left_over_from_an_earlier_session_is_still_released(node) -> None:  # noqa: ANN001
+    """The bug that made the whole feature never fire.
+
+    Refusing to release a model this session did not load is right on a shared node and
+    wrong everywhere else — and it is self-perpetuating. The node loads on demand, so the
+    model becomes resident the first time anyone transcribes; from then on every launch
+    finds it warm, adopts it, and releases nothing. 2.8 GB stays held forever on an 8 GB
+    board, which is the opposite of what binding residency to the session is for.
+    """
+    node.resident = "qwen3-asr-1_7b-q8"
+    companion = NodeCompanion(URL)
+
+    companion.start()
+    assert node.loads == [], "it was already warm; loading again would be pointless"
+
+    companion.stop()
+    assert node.releases == [{"kind": "asr"}], "the session ended, so the memory goes back"
+
+
+def test_a_shared_node_can_keep_the_old_discipline(node) -> None:  # noqa: ANN001
+    """Opt-out, because "the last client to quit unloads your model" is a bad rule when
+    there really is more than one client."""
+    node.resident = "qwen3-asr-1_7b-q8"
+    companion = NodeCompanion(URL, release_on_exit=False)
+
+    companion.start()
+    companion.stop()
+
+    assert node.releases == [], "not ours to release, and this deployment says so"
+
+
+def test_the_opt_out_still_releases_what_this_session_loaded(node) -> None:  # noqa: ANN001
+    companion = NodeCompanion(URL, release_on_exit=False)
+    companion.start()
+    assert node.loads == [{"kind": "asr"}]
+
+    companion.stop()
+    assert node.releases == [{"kind": "asr"}], "we loaded it, so we hand it back"

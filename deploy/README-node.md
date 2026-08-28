@@ -133,9 +133,16 @@ The model is 2799 MiB of it; the service is under 100. So residency follows the 
 by default, and the service is left alone — it costs almost nothing idle, survives a
 network blip mid-sentence, and keeps the node usable by anything else on the LAN.
 
-**Nothing is released that the session did not cause.** A node found already holding a
-model is left exactly as it was: on a shared board, "the last client to quit unloads your
-model" is a bad rule.
+**Quitting hands the model back**, whether or not this session was the one that loaded
+it. An earlier version released only what it had loaded itself, reasoning that unloading
+somebody else's model is rude — sound in the abstract, and it meant the feature never
+fired. The node loads on demand, so the model becomes resident the first time anyone
+transcribes; from then on every launch found it warm, adopted it, and released nothing.
+
+Set `node_release_on_exit = false` for a node that genuinely has more than one client,
+where the last one to quit should not unload a model somebody else is mid-sentence with.
+The node has no notion of sessions, so "already resident" cannot tell "somebody is using
+this" from "I left it there yesterday" — only the deployment knows which it is.
 
 ### Having the app start the node too
 
