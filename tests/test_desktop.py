@@ -1510,7 +1510,7 @@ def test_everything_is_available_when_nothing_is_running(qt_app):
     assert window.copy_button.isEnabled()
     assert window.clear_button.isEnabled()
     assert window.refine_button.isEnabled()
-    assert window.copy_refined_button.isEnabled()
+    assert window.copy_raw_button.isEnabled()
     assert window.save_refined_button.isEnabled()
     assert window.instruction.isEnabled()
     bridge.stop()
@@ -1537,7 +1537,7 @@ def test_a_refinement_in_flight_protects_the_text_it_is_working_from(qt_app):
 
     # Reading harms nothing, and the user may well want the text while they wait.
     assert window.copy_button.isEnabled()
-    assert window.copy_refined_button.isEnabled()
+    assert window.copy_raw_button.isEnabled()
     window._refiner = None
     bridge.stop()
 
@@ -1558,15 +1558,16 @@ def test_the_refined_pane_drives_its_own_buttons(qt_app):
     """They used to be set once, by the handler that produced a result, so nothing that
     happened afterwards could correct them."""
     window, bridge = _idle_window(qt_app)
-    assert window.copy_refined_button.isEnabled()
+    assert window.save_refined_button.isEnabled()
+    assert "整理结果" in window.copy_button.toolTip(), "复制 follows the pane too"
 
     window.refined_text.clear()
-    assert not window.copy_refined_button.isEnabled()
     assert not window.save_refined_button.isEnabled()
+    assert "原始转写" in window.copy_button.toolTip()
 
     window.refined_text.setPlainText("再次整理的结果")
-    assert window.copy_refined_button.isEnabled()
     assert window.save_refined_button.isEnabled()
+    assert "整理结果" in window.copy_button.toolTip()
     bridge.stop()
 
 
@@ -1668,4 +1669,56 @@ def test_recording_is_available_again_once_a_refinement_ends(qt_app):
     assert window.toggle_button.isEnabled(), "nothing is running; recording must be possible"
     window._clear_result()
     assert window.toggle_button.isEnabled(), "clearing text has nothing to do with recording"
+    bridge.stop()
+
+
+def _clipboard_text() -> str:
+    return QApplication.clipboard().text()
+
+
+def test_copy_takes_the_refined_text_once_there_is_one(qt_app):
+    """复制 is the action people reach for after refining, and it was handing back the
+    raw transcript — the thing they had just asked to have tidied up."""
+    context = AppContext()
+    bridge = QtEventBridge(context.bus)
+    window = DictationWindow(context, bridge, DictationController(context))
+
+    window.last_text.setPlainText("嗯那个我们下周一要交三个报告")
+    window.copy_button.click()
+    assert _clipboard_text() == "嗯那个我们下周一要交三个报告", "no refinement yet"
+
+    window.refined_text.setPlainText("我们下周一要交三个报告。")
+    window.copy_button.click()
+    assert _clipboard_text() == "我们下周一要交三个报告。"
+    bridge.stop()
+
+
+def test_the_original_stays_reachable_after_a_refinement(qt_app):
+    """The two panes exist because the transcript is the evidence. Making 复制 prefer the
+    refinement is only safe while the original is still one click away."""
+    context = AppContext()
+    bridge = QtEventBridge(context.bus)
+    window = DictationWindow(context, bridge, DictationController(context))
+
+    window.last_text.setPlainText("原始的逐字转写")
+    window.refined_text.setPlainText("整理过的版本。")
+    window.copy_raw_button.click()
+
+    assert _clipboard_text() == "原始的逐字转写"
+    bridge.stop()
+
+
+def test_copying_says_which_of_the_two_it_took(qt_app):
+    """Otherwise the button silently changes meaning halfway through a session."""
+    context = AppContext()
+    bridge = QtEventBridge(context.bus)
+    window = DictationWindow(context, bridge, DictationController(context))
+
+    window.last_text.setPlainText("逐字转写")
+    window.copy_button.click()
+    assert "原文" in window.status_message.text()
+
+    window.refined_text.setPlainText("整理结果。")
+    window.copy_button.click()
+    assert "整理" in window.status_message.text()
     bridge.stop()

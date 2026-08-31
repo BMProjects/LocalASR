@@ -202,11 +202,20 @@ class DictationWindow(ShellWindow):
         self.result_title.setObjectName("sectionTitle")
         self.copy_button = QPushButton("复制")
         self.copy_button.setEnabled(False)
+        # Takes the refinement when there is one. It is the button people reach for
+        # after asking for a tidy-up, and handing back the untidied version is not what
+        # that gesture means.
         self.clear_button = QPushButton("清空")
         self.clear_button.setEnabled(False)
         result_heading.addWidget(self.result_title)
         result_heading.addStretch(1)  # buttons are inserted after the title
         result_heading.addWidget(self.copy_button)
+        # 复制原文 belongs beside 复制, not across the row from it: they are the same
+        # action on the two panes, and separating them made the pair read as unrelated.
+        self.copy_raw_button = QPushButton("复制原文")
+        self.copy_raw_button.setEnabled(False)
+        self.copy_raw_button.setToolTip("复制左侧的原始转写，不含整理结果")
+        result_heading.addWidget(self.copy_raw_button)
         result_heading.addWidget(self.clear_button)
         self.last_text = QTextEdit()
         # Editable: the point of dictation is to fix the one word it got wrong before
@@ -251,9 +260,6 @@ class DictationWindow(ShellWindow):
         panes.addWidget(self.last_text, 1)
         panes.addWidget(self.refined_text, 1)
 
-        self.copy_refined_button = QPushButton("复制整理结果")
-        self.copy_refined_button.setEnabled(False)
-        self.copy_refined_button.setToolTip("整理完成后可用")
         # Saving writes both layers, not just the tidied one. A refinement without the
         # transcript beside it is a claim with its evidence thrown away — and under a
         # custom instruction it is a rewrite whose fidelity was never proven.
@@ -261,8 +267,7 @@ class DictationWindow(ShellWindow):
         self.save_refined_button.setEnabled(False)
         self.save_refined_button.setToolTip("整理完成后可用；保存时会一并写入原始转写")
         self.save_refined_button.clicked.connect(self._save_refined)
-        result_heading.insertWidget(1, self.copy_refined_button)
-        result_heading.insertWidget(2, self.save_refined_button)
+        result_heading.insertWidget(1, self.save_refined_button)
 
         # The instruction sits next to the button that uses it, not in a settings dialog:
         # it is the thing most likely to change between one recording and the next.
@@ -316,7 +321,7 @@ class DictationWindow(ShellWindow):
         self.refine_button.clicked.connect(self._refine)
         self.instruction.editingFinished.connect(self._save_instruction)
         self.instruction.returnPressed.connect(self._refine)
-        self.copy_refined_button.clicked.connect(self._copy_refined)
+        self.copy_raw_button.clicked.connect(self._copy_raw)
         self.copy_button.clicked.connect(self._copy_last)
         self.clear_button.clicked.connect(self._clear_result)
         self.last_text.textChanged.connect(self._result_changed)
@@ -526,8 +531,11 @@ class DictationWindow(ShellWindow):
         )
         refining = self._refiner is not None
 
-        self.copy_button.setEnabled(has_raw)
-        self.copy_refined_button.setEnabled(has_refined)
+        self.copy_button.setEnabled(has_raw or has_refined)
+        self.copy_button.setToolTip(
+            "复制整理结果（原文用「复制原文」）" if has_refined else "复制原始转写"
+        )
+        self.copy_raw_button.setEnabled(has_raw)
         self.save_refined_button.setEnabled(has_refined)
 
         # 开始识别 belongs here too, not in `_show_state`. Split across the two, the two
@@ -673,21 +681,31 @@ class DictationWindow(ShellWindow):
             self.refine_status.setText(f"整理要求本次有效，但保存失败：{exc}")
             self.refine_status.show()
 
-    def _copy_refined(self) -> None:
-        from PySide6.QtWidgets import QApplication
-
-        text = self.refined_text.toPlainText()
-        if text:
-            QApplication.clipboard().setText(text)
-            self.refine_status.setText("整理结果已复制到剪贴板。")
+    def _copy_raw(self) -> None:
+        """The transcript exactly as it was recognised."""
+        self._copy(self.last_text.toPlainText(), "原文")
 
     def _copy_last(self) -> None:
+        """Whichever of the two the user most likely wants.
+
+        The refinement when one exists: asking for a tidy-up and then being handed the
+        untidied text back is the one outcome nobody wants from this button. Which of
+        the two it took is said out loud, because a button that changes meaning halfway
+        through a session must not do it silently.
+        """
+        refined = self.refined_text.toPlainText()
+        if refined.strip():
+            self._copy(refined, "整理结果")
+        else:
+            self._copy(self.last_text.toPlainText(), "原文")
+
+    def _copy(self, text: str, what: str) -> None:
         from PySide6.QtWidgets import QApplication
 
-        text = self.last_text.toPlainText()
-        if text:
-            QApplication.clipboard().setText(text)
-            self.status_message.setText("最近一次识别结果已复制到剪贴板。")
+        if not text.strip():
+            return
+        QApplication.clipboard().setText(text)
+        self.status_message.setText(f"已复制{what}到剪贴板。")
 
 
 

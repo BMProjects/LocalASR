@@ -86,7 +86,9 @@ def test_an_accepted_refinement_is_shown_beside_the_original(window) -> None:  #
     assert window.last_text.toPlainText() == RAW, "the original stays put"
     assert window.refined_text.toPlainText() == "我们下周一交三个报告。"
     assert window.refined_text.isVisibleTo(window)
-    assert window.copy_refined_button.isEnabled()
+    # 复制 now takes the refinement; the transcript stays reachable beside it.
+    assert window.copy_button.isEnabled() and window.copy_raw_button.isEnabled()
+    assert window.save_refined_button.isEnabled()
 
 
 def test_the_refined_pane_is_read_only(window) -> None:  # noqa: ANN001
@@ -127,7 +129,7 @@ def test_clearing_removes_both_panes(window) -> None:  # noqa: ANN001
     assert window.refined_text.toPlainText() == ""
     # The pane stays on screen; clearing empties it rather than removing the comparison.
     assert window.refined_text.isVisibleTo(window)
-    assert not window.copy_refined_button.isEnabled()
+    assert not window.save_refined_button.isEnabled()
 
 
 def test_a_crashing_refinement_still_reports_something(qt_app) -> None:
@@ -201,7 +203,7 @@ def test_the_two_pane_layout_is_visible_before_any_refinement(window) -> None:  
     assert window.instruction.isVisibleTo(window)
     assert window.refine_button.isVisibleTo(window)
     # Present but disabled, rather than absent: the actions are part of the shape.
-    for button in (window.copy_refined_button, window.save_refined_button):
+    for button in (window.copy_raw_button, window.save_refined_button):
         assert button.isVisibleTo(window)
         assert not button.isEnabled()
 
