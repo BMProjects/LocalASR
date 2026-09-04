@@ -166,7 +166,7 @@ def test_saving_writes_the_transcript_alongside_the_refinement(  # noqa: ANN001
     monkeypatch.setattr(
         QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), ""))
     )
-    window.instruction.setText("提取成待办列表")
+    window.instruction.setPlainText("提取成待办列表")
     window.last_text.setPlainText(RAW)
     window._refined(_accepted(RAW, "- 交三个报告\n- 准备演示"))
     window._save_refined()

@@ -204,6 +204,9 @@ class _ProbeThread(QThread):
 class BackendPanel(QFrame):
     """Live status of the recognition node and the refinement backend."""
 
+    summary = Signal(str)
+    """One line describing both backends, for whoever is showing this panel folded."""
+
     def __init__(self, context: AppContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.context = context
@@ -428,6 +431,9 @@ class BackendPanel(QFrame):
         self._probe.start()
 
     def _show(self, asr: BackendStatus, refiner: BackendStatus) -> None:
+        # Broadcast for a collapsed header: folding setup away must not fold away the
+        # answer to "is it working".
+        self.summary.emit(f"识别 {asr.label} · 整理 {refiner.label}")
         for pill, detail, status in (
             (self.asr_pill, self.asr_detail, asr),
             (self.refiner_pill, self.refiner_detail, refiner),

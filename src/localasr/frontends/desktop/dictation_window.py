@@ -8,15 +8,15 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Signal
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -41,6 +41,7 @@ from localasr.apps.events import (
 from localasr.context import AppContext
 from localasr.frontends.desktop.backend_panel import BackendPanel
 from localasr.frontends.desktop.backend_panel import setup_panel as make_setup_panel
+from localasr.frontends.desktop.collapsible import CollapsibleSection
 from localasr.frontends.desktop.device_panel import DevicePanel
 from localasr.frontends.desktop.model_panel import ModelPanel
 from localasr.frontends.desktop.shell import ShellWindow
@@ -133,12 +134,12 @@ class DictationWindow(ShellWindow):
 
         self.setObjectName("appSurface")
         self.setWindowTitle("LocalASR — 语音输入")
-        # Both values clear the layout's own minimum (845 px), which is dominated by the
-        # transcript's 240 px floor plus the refinement row and the two pane headings.
-        # Below that minimum the wrapped guidance labels are clipped rather than
+        # Clears the layout's own minimum in both states — folded and with the setup
+        # section open — so expanding it never pushes the window past a laptop screen.
+        # Below the layout minimum the wrapped guidance labels are clipped rather than
         # reflowed.
-        self.resize(1000, 920)
-        self.setMinimumSize(620, 850)
+        self.resize(1000, 860)
+        self.setMinimumSize(620, 645)
 
         title = QLabel("语音输入")
         title.setObjectName("pageTitle")
@@ -156,6 +157,19 @@ class DictationWindow(ShellWindow):
         self.model_panel = panel if isinstance(panel, ModelPanel) else None
 
         self.device_panel = DevicePanel(context)
+
+        # Which models are loaded and which microphone is selected matter while a session
+        # is being arranged and never afterwards, but they were taking two cards above the
+        # text this window exists to show. Folded away by default, with the header
+        # carrying the one line that answers "is it working".
+        self.setup = CollapsibleSection("识别与整理设置")
+        self.setup.add(panel)
+        self.setup.add(self.device_panel)
+        self.setup.set_summary("正在检查…")
+        if self.backend_panel is not None:
+            self.backend_panel.summary.connect(self.setup.set_summary)
+        else:
+            self.setup.set_summary("本机模型 · 点开展开设置")
 
         status_card = QFrame()
         status_card.setObjectName("card")
@@ -228,7 +242,11 @@ class DictationWindow(ShellWindow):
         # This is what the window is for, so it gets the floor and all the slack. The
         # setup cards above it are fixed-height by construction, so every pixel gained
         # by compacting them and every pixel of a resize lands here.
-        self.last_text.setMinimumHeight(240)
+        # A floor, not an allocation. The panes are the only thing in the window that
+        # stretches, so every pixel the window has beyond its fixed rows lands here;
+        # setting a tall minimum instead would only stop the window fitting a laptop
+        # screen once the setup section is expanded.
+        self.last_text.setMinimumHeight(200)
 
         # The refined pane sits beside the original rather than replacing it. A tidy-up
         # is a proposal, not a correction: the only way to judge it is to read both, and
@@ -240,7 +258,7 @@ class DictationWindow(ShellWindow):
             "通不过校验时会显示原文并说明原因——一个看起来合理的错数字，"
             "比明显未经润色的文字危险得多。"
         )
-        self.refined_text.setMinimumHeight(240)
+        self.refined_text.setMinimumHeight(200)
 
         # Both panes are visible from the start, each under its own heading. Hiding the
         # right one until a refinement succeeded meant the window could not explain its
@@ -271,16 +289,21 @@ class DictationWindow(ShellWindow):
 
         # The instruction sits next to the button that uses it, not in a settings dialog:
         # it is the thing most likely to change between one recording and the next.
-        self.instruction = QLineEdit(self.context.settings.refine_instruction)
+        self.instruction = QPlainTextEdit(self.context.settings.refine_instruction)
+        # Three lines: the instructions people actually write are a sentence or two, and
+        # a single line hid the end of every one of them. Fixed height rather than
+        # stretching, because the two panes below are what the space belongs to.
+        self.instruction.setFixedHeight(64)
         self.instruction.setPlaceholderText(
-            "整理要求（留空 = 只加标点、删口头填充，逐字保留）"
+            "整理要求。留空 = 保守清理：只加标点、删口头填充，逐字保留，\n"
+            "结果会和原文几乎一样。写点什么，模型才会改写。\n"
+            "例如：提取成待办列表 / 概括成会议纪要 / 改写成正式邮件"
         )
         self.instruction.setToolTip(
             "例如：提取成待办列表 / 写成会议纪要 / 改写成正式邮件。\n"
             "留空时使用保守清理，可以证明没有增删实义内容；\n"
             "填入要求后模型会改写，只能做风险筛查，请与左侧原文核对。"
         )
-        self.instruction.setClearButtonEnabled(True)
         self.refine_button = QPushButton("整理文本")
         self.refine_button.setEnabled(False)
         self.refine_button.setMinimumWidth(110)
@@ -309,8 +332,7 @@ class DictationWindow(ShellWindow):
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(11)
         layout.addLayout(heading)
-        layout.addWidget(panel)
-        layout.addWidget(self.device_panel)
+        layout.addWidget(self.setup)
         layout.addWidget(status_card)
         layout.addWidget(result_card, 1)
         layout.addWidget(self.delivery)
@@ -319,8 +341,9 @@ class DictationWindow(ShellWindow):
             lambda: self.toggle(deliver=self.auto_deliver.isChecked())
         )
         self.refine_button.clicked.connect(self._refine)
-        self.instruction.editingFinished.connect(self._save_instruction)
-        self.instruction.returnPressed.connect(self._refine)
+        # No editingFinished on a plain text edit, and Enter now makes a new line.
+        self.instruction.focusOutEvent = self._instruction_focus_out
+        QShortcut(QKeySequence("Ctrl+Return"), self.instruction, self._refine)
         self.copy_raw_button.clicked.connect(self._copy_raw)
         self.copy_button.clicked.connect(self._copy_last)
         self.clear_button.clicked.connect(self._clear_result)
@@ -478,7 +501,12 @@ class DictationWindow(ShellWindow):
             self._show_state(self.controller.state, self._completion_detail)
 
     def _append_new_segments(self) -> None:
-        """Add only the sentences not shown yet, at the end.
+        """Add the sentences not shown yet, where the cursor is.
+
+        At the cursor rather than always at the end, because dictation is used to fill in
+        a gap as often as to keep going: put the caret mid-paragraph, speak, and the words
+        land there. The caret is left after the new text, so the sentence after it
+        continues in the same place instead of jumping back to the bottom.
 
         Replacing the whole box with the controller's text would be simpler and would
         discard the user's edits every time another sentence arrived.
@@ -488,12 +516,21 @@ class DictationWindow(ShellWindow):
         self._rendered = len(settled)
         if not fresh:
             return
+
         cursor = self.last_text.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        separator = (
-            "" if not self.last_text.toPlainText() else self.controller.options.join_separator
-        )
-        cursor.insertText(separator + "".join(fresh))
+        text = self.last_text.toPlainText()
+        at = min(cursor.position(), len(text))
+        joiner = self.controller.options.join_separator
+        # A separator only where it joins two things. Inserting into empty space, or
+        # against one that is already there, would leave a stray comma.
+        lead = joiner if text[:at].strip() and not text[:at].endswith(joiner) else ""
+        trail = joiner if text[at:].strip() and not text[at:].startswith(joiner) else ""
+
+        cursor.insertText(lead + "".join(fresh))
+        landed = cursor.position()
+        if trail:
+            cursor.insertText(trail)
+            cursor.setPosition(landed)
         self.last_text.setTextCursor(cursor)
         self.last_text.ensureCursorVisible()
 
@@ -589,7 +626,7 @@ class DictationWindow(ShellWindow):
         raw = self.last_text.toPlainText().strip()
         if not raw or self._refiner is not None:
             return
-        instruction = self.instruction.text().strip()
+        instruction = self.instruction.toPlainText().strip()
         self.refine_status.setText(
             f"正在按「{instruction}」整理…" if instruction else "正在整理…"
         )
@@ -624,8 +661,15 @@ class DictationWindow(ShellWindow):
             # the Orin it dropped 「我们」 and would not have counted it. An unverified
             # tally reads as assurance, and the only real check here is a person reading
             # both panes.
+            # Say that this mode barely changes the text, because it barely changes the
+            # text — measured at 93% character overlap. "整理完成" over something that
+            # reads like the original is how conservative cleaning gets mistaken for a
+            # model that ignored the request.
             warnings = "；".join(i.detail for i in result.warnings)
-            note = "整理完成，请与左侧原文核对。"
+            note = (
+                "保守清理完成：只加了标点、删了口头填充，逐字保留。"
+                "要让模型改写，请在上方填写整理要求。"
+            )
             self.refine_status.setText(f"{note}{' 注意：' + warnings if warnings else ''}")
         else:
             # Never show the model's version when a check failed. The pane holds the
@@ -651,7 +695,7 @@ class DictationWindow(ShellWindow):
             return
 
         path = Path(path_text)
-        instruction = self.instruction.text().strip()
+        instruction = self.instruction.toPlainText().strip()
         if path.suffix.lower() == ".txt":
             body = refined
         else:
@@ -669,9 +713,14 @@ class DictationWindow(ShellWindow):
             return
         self.refine_status.setText(f"已保存到 {path}")
 
+    def _instruction_focus_out(self, event: object) -> None:
+        """QPlainTextEdit has no editingFinished; losing focus is the same moment."""
+        QPlainTextEdit.focusOutEvent(self.instruction, event)
+        self._save_instruction()
+
     def _save_instruction(self) -> None:
         """Persist the standing instruction; it is the same one most of the time."""
-        text = self.instruction.text().strip()
+        text = self.instruction.toPlainText().strip()
         if text == self.context.settings.refine_instruction:
             return
         self.context.settings.refine_instruction = text

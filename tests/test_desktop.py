@@ -17,7 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6", reason="desktop frontend requires the [gui] extra")
 
 from PySide6.QtCore import QCoreApplication  # noqa: E402
-from PySide6.QtGui import QShortcut  # noqa: E402
+from PySide6.QtGui import QShortcut, QTextCursor  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from localasr.apps.bus import EventBus  # noqa: E402
@@ -944,11 +944,51 @@ def test_new_sentences_are_appended_without_discarding_edits(qt_app):
     window._on_event(FinalTranscript(first))
     assert window.last_text.toPlainText() == "第一句"
 
+    # As a person editing would leave it: caret after the text they just fixed.
+    # `setPlainText` alone parks the caret at position 0, which is a programmatic
+    # artefact rather than anything a user does.
     window.last_text.setPlainText("第一句（已改）")
+    window.last_text.moveCursor(QTextCursor.MoveOperation.End)
     controller.segments = (first, second)
     window._on_event(FinalTranscript(second))
 
     assert window.last_text.toPlainText() == "第一句（已改）第二句"
+    bridge.stop()
+
+
+def test_new_sentences_land_where_the_caret_is(qt_app):
+    """Dictation fills a gap as often as it continues a paragraph: put the caret in the
+    middle, speak, and the words go there rather than to the bottom."""
+    from localasr.apps.dictation import DictationOptions
+    from localasr.apps.events import FinalTranscript
+    from localasr.core.types import Segment, Span
+    from localasr.frontends.desktop.dictation_window import DictationWindow
+
+    inserted = Segment(span=Span(0.0, 1.0), text="补充的一句", utterance_id="a")
+
+    class Recording:
+        recording = True
+        state = RECORDING
+        current_text = ""
+        options = DictationOptions()
+        segments = ()
+
+    controller = Recording()
+    context = AppContext()
+    bridge = QtEventBridge(context.bus)
+    window = DictationWindow(context, bridge, controller)
+
+    window.last_text.setPlainText("开头。结尾。")
+    cursor = window.last_text.textCursor()
+    cursor.setPosition(3)  # right after 「开头。」
+    window.last_text.setTextCursor(cursor)
+
+    controller.segments = (inserted,)
+    window._on_event(FinalTranscript(inserted))
+
+    assert window.last_text.toPlainText() == "开头。补充的一句结尾。"
+    # The caret follows the new text, so the next sentence continues beside it.
+    assert window.last_text.textCursor().position() == len("开头。补充的一句")
     bridge.stop()
 
 
@@ -1721,4 +1761,63 @@ def test_copying_says_which_of_the_two_it_took(qt_app):
     window.refined_text.setPlainText("整理结果。")
     window.copy_button.click()
     assert "整理" in window.status_message.text()
+    bridge.stop()
+
+
+def test_setup_is_folded_away_but_still_answers_is_it_working(qt_app):
+    """Two setup cards were sitting above the text the window exists to show. Folding
+    them is only worth doing if the fold does not also hide whether the backends are up,
+    so the header carries the summary the open panel would have given."""
+    context = AppContext()
+    context.settings.node_url = "http://asr-node.local:8090"
+    bridge = QtEventBridge(context.bus)
+    window = DictationWindow(context, bridge, DictationController(context))
+
+    assert not window.setup.expanded, "setup is arranged once and then in the way"
+    assert not window.device_panel.isVisibleTo(window.setup)
+
+    window.backend_panel.summary.emit("识别 就绪 · 整理 未启动")
+    assert "识别 就绪" in window.setup.summary.text()
+
+    window.setup.set_expanded(True)
+    assert window.device_panel.isVisibleTo(window.setup)
+    assert not window.setup.summary.isVisibleTo(window.setup), "the panel repeats it"
+    bridge.stop()
+
+
+def test_the_panes_get_the_space_the_window_has_to_give(qt_app):
+    """The transcript and the refinement are the work; everything else is a fixed row."""
+    context = AppContext()
+    bridge = QtEventBridge(context.bus)
+    window = DictationWindow(context, bridge, DictationController(context))
+    window.resize(1000, 900)
+    _pump()
+
+    # Both panes stretch; the instruction box deliberately does not.
+    assert window.instruction.maximumHeight() == window.instruction.minimumHeight()
+    assert window.last_text.sizePolicy().verticalPolicy() != 0
+    bridge.stop()
+
+
+def test_a_conservative_result_says_it_barely_changes_the_text(qt_app):
+    """93% character overlap, measured. "整理完成" over something that reads like the
+    original is how conservative cleaning gets mistaken for a model ignoring the
+    request — which is exactly the report this came from."""
+    from localasr.refine.types import RefinementMode, RefinementResult
+
+    context = AppContext()
+    bridge = QtEventBridge(context.bus)
+    window = DictationWindow(context, bridge, DictationController(context))
+
+    window._refined(
+        RefinementResult(
+            raw_text="嗯我们下周一交报告",
+            refined_text="我们下周一交报告。",
+            mode=RefinementMode.CONSERVATIVE,
+            source_segment_ids=(),
+        )
+    )
+
+    said = window.refine_status.text()
+    assert "保守" in said and "整理要求" in said, said
     bridge.stop()
