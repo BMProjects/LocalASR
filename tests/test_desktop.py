@@ -1799,10 +1799,9 @@ def test_the_panes_get_the_space_the_window_has_to_give(qt_app):
     bridge.stop()
 
 
-def test_a_conservative_result_says_it_barely_changes_the_text(qt_app):
-    """93% character overlap, measured. "整理完成" over something that reads like the
-    original is how conservative cleaning gets mistaken for a model ignoring the
-    request — which is exactly the report this came from."""
+def test_a_correction_says_what_it_did(qt_app):
+    """It used to say only 整理完成 over text that read like the original, which is how
+    correction got mistaken for a model ignoring the request."""
     from localasr.refine.types import RefinementMode, RefinementResult
 
     context = AppContext()
@@ -1819,5 +1818,5 @@ def test_a_conservative_result_says_it_barely_changes_the_text(qt_app):
     )
 
     said = window.refine_status.text()
-    assert "保守" in said and "整理要求" in said, said
+    assert "修正" in said and "对读" in said, said
     bridge.stop()

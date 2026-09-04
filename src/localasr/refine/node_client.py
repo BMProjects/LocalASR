@@ -15,7 +15,7 @@ from __future__ import annotations
 import httpx
 
 from localasr.refine.serde import result_from_dict
-from localasr.refine.types import FidelityIssue, RefinementRequest, RefinementResult
+from localasr.refine.types import RefinementRequest, RefinementResult
 
 REFINEMENT_TIMEOUT = 180.0
 """Generous: on a Jetson in sequential mode this request may first evict the ASR model
@@ -73,8 +73,4 @@ class NodeRefiner:
 
 
 def _unavailable(request: RefinementRequest, detail: str) -> RefinementResult:
-    return RefinementResult.rejected(
-        request,
-        refined_text="",
-        issues=(FidelityIssue("unavailable", detail),),
-    )
+    return RefinementResult.failed(request, detail)

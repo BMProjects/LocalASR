@@ -47,12 +47,8 @@ from localasr.frontends.desktop.model_panel import ModelPanel
 from localasr.frontends.desktop.shell import ShellWindow
 from localasr.frontends.desktop.theme import set_role, set_tone
 from localasr.platform import text_output
-from localasr.refine.types import (
-    FidelityIssue,
-    RefinementMode,
-    RefinementRequest,
-    RefinementResult,
-)
+from localasr.refine.prompts import DEFAULT_INSTRUCTION
+from localasr.refine.types import RefinementMode, RefinementRequest, RefinementResult
 
 _STATE_COPY = {
     IDLE: ("就绪", "neutral", "点击开始，说完后再次点击；识别结果会保留在窗口中。"),
@@ -97,13 +93,7 @@ class _RefineThread(QThread):
             # `refine` is documented as never raising, but a thread that ends without
             # emitting leaves the button re-enabled and nothing on screen, which is
             # indistinguishable from the request having been ignored. Belt and braces.
-            self.done.emit(
-                RefinementResult.rejected(
-                    self._request,
-                    refined_text="",
-                    issues=(FidelityIssue("unavailable", f"整理失败：{exc}"),),
-                )
-            )
+            self.done.emit(RefinementResult.failed(self._request, f"整理失败：{exc}"))
 
 
 class DictationWindow(ShellWindow):
@@ -289,20 +279,24 @@ class DictationWindow(ShellWindow):
 
         # The instruction sits next to the button that uses it, not in a settings dialog:
         # it is the thing most likely to change between one recording and the next.
-        self.instruction = QPlainTextEdit(self.context.settings.refine_instruction)
+        # Prefilled with the default rather than left blank behind a placeholder. The
+        # instruction *is* the prompt now, so one the user cannot see is one they cannot
+        # steer — and "why did it only add punctuation" was never answerable while the
+        # rule doing that lived in the source.
+        self.instruction = QPlainTextEdit(
+            self.context.settings.refine_instruction or DEFAULT_INSTRUCTION
+        )
         # Three lines: the instructions people actually write are a sentence or two, and
         # a single line hid the end of every one of them. Fixed height rather than
         # stretching, because the two panes below are what the space belongs to.
         self.instruction.setFixedHeight(64)
         self.instruction.setPlaceholderText(
-            "整理要求。留空 = 保守清理：只加标点、删口头填充，逐字保留，\n"
-            "结果会和原文几乎一样。写点什么，模型才会改写。\n"
-            "例如：提取成待办列表 / 概括成会议纪要 / 改写成正式邮件"
+            "发给模型的要求。清空则用默认的纠错要求。\n"
+            "例如：概括成三条要点 / 提取成待办列表 / 改写成正式邮件"
         )
         self.instruction.setToolTip(
-            "例如：提取成待办列表 / 写成会议纪要 / 改写成正式邮件。\n"
-            "留空时使用保守清理，可以证明没有增删实义内容；\n"
-            "填入要求后模型会改写，只能做风险筛查，请与左侧原文核对。"
+            "这段文字几乎就是发给模型的全部提示词，改它就能改变输出。\n"
+            "Ctrl+Enter 直接整理。结果请与左侧原文对读。"
         )
         self.refine_button = QPushButton("整理文本")
         self.refine_button.setEnabled(False)
@@ -645,37 +639,28 @@ class DictationWindow(ShellWindow):
         self._show_state(self.controller.state)
 
     def _refined(self, result: object) -> None:
-        self.refined_text.setPlainText(result.text)
+        # The refined pane shows the refinement or nothing. Putting the transcript there
+        # when none was produced is what made three separate reports read as "the model
+        # just repeated my text".
+        self.refined_text.setPlainText(result.refined_text)
 
-        if result.accepted and result.mode is not RefinementMode.CONSERVATIVE:
-            # A custom instruction rewrites; the subsequence proof does not hold and
-            # saying "已完成" alone would imply a guarantee that is not there.
-            warnings = "；".join(i.detail for i in result.warnings)
-            self.refine_status.setText(
-                "已按你的要求改写——这一模式无法证明内容未被改动，请与左侧原文核对。"
-                + (f" 注意：{warnings}" if warnings else "")
-            )
-        elif result.accepted:
-            # No count of what was removed. The model used to report that itself, which
-            # is exactly the number not to trust: in the one real refinement measured on
-            # the Orin it dropped 「我们」 and would not have counted it. An unverified
-            # tally reads as assurance, and the only real check here is a person reading
-            # both panes.
-            # Say that this mode barely changes the text, because it barely changes the
-            # text — measured at 93% character overlap. "整理完成" over something that
-            # reads like the original is how conservative cleaning gets mistaken for a
-            # model that ignored the request.
-            warnings = "；".join(i.detail for i in result.warnings)
-            note = (
-                "保守清理完成：只加了标点、删了口头填充，逐字保留。"
-                "要让模型改写，请在上方填写整理要求。"
-            )
-            self.refine_status.setText(f"{note}{' 注意：' + warnings if warnings else ''}")
-        else:
-            # Never show the model's version when a check failed. The pane holds the
-            # original, and the reason is stated rather than left as silence.
-            reasons = "；".join(i.detail for i in result.errors)
-            self.refine_status.setText(f"整理结果未通过校验，右侧沿用原文。原因：{reasons}")
+        if not result.ok:
+            # Nothing was produced, so there is nothing to show. Say why rather than
+            # leaving the pane empty, which reads as the button not having worked.
+            self.refine_status.setText(f"整理未完成：{result.failure}")
+            self._result_changed()
+            return
+
+        # Notes are advisory and never withhold anything. Numbers are the one thing a
+        # reader skims past — a substituted word reads oddly and gets noticed, 三十五万
+        # and 三十六万 do not.
+        notes = "；".join(n.detail for n in result.notes)
+        done = (
+            "已按你的要求改写。"
+            if result.mode is not RefinementMode.CONSERVATIVE
+            else "已修正识别错误并加标点，意思和顺序保持不变。"
+        )
+        self.refine_status.setText(f"{done}请与左侧原文对读。{' 注意：' + notes if notes else ''}")
 
     def _refine_finished(self) -> None:
         self._refiner = None

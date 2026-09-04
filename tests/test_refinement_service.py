@@ -35,36 +35,38 @@ def _answering(refined: str, **kwargs):  # noqa: ANN001, ANN202
     return handler
 
 
-def test_a_clean_refinement_is_accepted() -> None:
+def test_a_refinement_is_returned_with_its_provenance() -> None:
     service = _service(_answering("我们下周一交三个报告。"))
     result = service.refine(
         RefinementRequest("嗯我们下周一交三个报告", source_segment_ids=("u1",))
     )
 
-    assert result.accepted
+    assert result.ok
     assert result.text == "我们下周一交三个报告。"
     assert result.source_segment_ids == ("u1",)
     assert result.model_revision == "deadbeef"
     assert result.template_revision
 
 
-def test_an_invented_number_is_rejected_and_the_raw_text_is_shown() -> None:
-    """The failure mode that matters: fluent, plausible and wrong."""
-    service = _service(_answering("我们下周五交三个报告。"))
+def test_a_changed_number_is_noted_and_still_shown() -> None:
+    """Nothing is withheld. The note points; the user is looking at both panes anyway,
+    and a refinement they cannot see is not a refinement."""
+    service = _service(_answering("我们下周五交五个报告。"))
     result = service.refine(RefinementRequest("嗯我们下周交三个报告"))
 
-    assert not result.accepted
-    assert result.text == "嗯我们下周交三个报告", "the model's version must not be shown"
-    assert result.refined_text, "but it is kept, so the interface can explain the rejection"
-    assert {issue.kind for issue in result.errors} & {"not_a_subsequence"}
+    assert result.ok
+    assert result.text == "我们下周五交五个报告。", "the model's version is what was asked for"
+    assert {note.kind for note in result.notes} == {"number_gone", "number_new"}
 
 
-def test_a_flipped_negation_is_rejected() -> None:
-    service = _service(_answering("这个方案我们采用。"))
-    result = service.refine(RefinementRequest("这个方案我们不采用"))
+def test_correcting_a_misheard_word_passes_without_comment() -> None:
+    """The product's main function: recognition returned a homophone and the model put
+    the intended word back. The old validator rejected exactly this."""
+    service = _service(_answering("我们用 Qwen3.5 模型跑一下基准测试。"))
+    result = service.refine(RefinementRequest("我们用瓶果三点五模型跑一下鸡准测试"))
 
-    assert not result.accepted
-    assert "negation_lost" in {issue.kind for issue in result.errors}
+    assert result.ok
+    assert result.text == "我们用 Qwen3.5 模型跑一下基准测试。"
 
 
 def test_a_transport_failure_degrades_to_the_raw_text() -> None:
@@ -72,23 +74,24 @@ def test_a_transport_failure_degrades_to_the_raw_text() -> None:
         raise httpx.ConnectError("refiner is down")
 
     result = _service(broken).refine(RefinementRequest("原始内容还在"))
-    assert not result.accepted
+    assert not result.ok, "no refinement exists, which is different from a doubtful one"
     assert result.text == "原始内容还在"
-    assert "unavailable" in {issue.kind for issue in result.errors}
+    assert result.refined_text == "", "nothing to show, so the pane stays empty"
+    assert "整理服务不可用" in result.failure
 
 
 def test_a_server_error_degrades_to_the_raw_text() -> None:
     service = _service(lambda _r: httpx.Response(503, text="model loading"))
     result = service.refine(RefinementRequest("原始内容还在"))
-    assert not result.accepted and result.text == "原始内容还在"
+    assert not result.ok and result.text == "原始内容还在"
 
 
-def test_model_warnings_are_surfaced_without_rejecting() -> None:
+def test_model_warnings_are_surfaced_as_notes() -> None:
     service = _service(_answering("我们下周交。", warnings=["两处说法不一致，均已保留"]))
     result = service.refine(RefinementRequest("嗯我们下周交"))
 
-    assert result.accepted
-    assert any("不一致" in issue.detail for issue in result.warnings)
+    assert result.ok
+    assert any("不一致" in note.detail for note in result.notes)
 
 
 
@@ -154,7 +157,7 @@ def test_the_output_budget_scales_with_the_input() -> None:
     [
         {"issues": [{"kind": "x", "detail": "y", "severity": "catastrophic"}]},
         {"issues": "not-a-list"},
-        {"issues": [None, 42, {"kind": "ok", "detail": "d"}]},
+        {"notes": [None, 42, {"kind": "ok", "detail": "d"}]},
         {"mode": "nonsense"},
         {"source_segment_ids": "not-a-list"},
         "not-a-dict-at-all",
@@ -163,38 +166,26 @@ def test_the_output_budget_scales_with_the_input() -> None:
 )
 def test_any_payload_parses_rather_than_raising(payload) -> None:  # noqa: ANN001
     """`NodeRefiner.refine` promises never to raise, but parsing used to sit outside the
-    guard: an unknown severity raised ValueError straight through it, into a worker
-    thread that then ended silently with the button re-enabled and nothing shown."""
+    guard, so a payload it could not read went straight through into a worker thread that
+    then ended silently with the button re-enabled and nothing shown."""
     from localasr.refine.serde import result_from_dict
 
     result = result_from_dict(payload, raw_text="原始文本")
     assert result.raw_text == "原始文本"
-    assert isinstance(result.issues, tuple)
-
-
-def test_an_unrecognised_severity_is_treated_as_an_error() -> None:
-    """A verdict this version cannot read is not grounds for showing the text as if it
-    had passed."""
-    from localasr.refine.serde import result_from_dict
-    from localasr.refine.types import Severity
-
-    result = result_from_dict(
-        {"issues": [{"kind": "k", "detail": "d", "severity": "from-the-future"}]},
-        raw_text="原文",
-    )
-    assert result.issues[0].severity is Severity.ERROR
+    assert isinstance(result.notes, tuple)
 
 
 def test_the_raw_text_comes_from_the_request_not_the_response() -> None:
-    """The caller holds what the user is looking at; a server echo is not authoritative
-    and is exactly what a rejection has to fall back to."""
+    """The caller holds what the user is looking at; a server echo is not authoritative,
+    and it is what a refinement that never happened falls back to."""
     from localasr.refine.serde import result_from_dict
 
     result = result_from_dict(
-        {"raw_text": "服务端记得的另一段文字", "refined_text": "x", "accepted": False},
+        {"raw_text": "服务端记得的另一段文字", "refined_text": "x", "failure": "节点不可达"},
         raw_text="用户面前的原文",
     )
     assert result.text == "用户面前的原文"
+    assert not result.ok
 
 
 def test_the_node_records_the_catalog_id_not_the_wire_alias() -> None:

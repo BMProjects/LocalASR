@@ -34,7 +34,6 @@ from localasr.refine.client import ChatCompletionClient
 from localasr.refine.serde import result_to_dict
 from localasr.refine.service import RefinementService
 from localasr.refine.types import (
-    FidelityIssue,
     RefinementMode,
     RefinementRequest,
     RefinementResult,
@@ -268,10 +267,9 @@ def create_app(config: NodeConfig | None = None) -> FastAPI:
             # a model that would not fit or a llama-server that would not start.
             return {
                 **result_to_dict(
-                    RefinementResult.rejected(
+                    RefinementResult.failed(
                         RefinementRequest(raw_text=raw_text, mode=mode),
-                        refined_text="",
-                        issues=(FidelityIssue("unavailable", f"节点无法加载整理模型：{exc}"),),
+                        f"节点无法加载整理模型：{exc}",
                     )
                 ),
                 "text": raw_text,

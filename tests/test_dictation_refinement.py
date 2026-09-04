@@ -22,8 +22,8 @@ from localasr.context import AppContext  # noqa: E402
 from localasr.frontends.desktop.dictation_window import DictationWindow  # noqa: E402
 from localasr.frontends.desktop.event_bridge import QtEventBridge  # noqa: E402
 from localasr.frontends.desktop.theme import apply_theme  # noqa: E402
-from localasr.refine.types import (  # noqa: E402
-    FidelityIssue,
+from localasr.refine.types import (
+    Note,  # noqa: E402
     RefinementMode,
     RefinementRequest,
     RefinementResult,
@@ -64,19 +64,22 @@ def test_refining_is_unavailable_without_a_node(window) -> None:  # noqa: ANN001
     assert "未配置整理服务" in window.refine_button.toolTip()
 
 
-def test_a_rejected_refinement_never_shows_the_model_output(window) -> None:  # noqa: ANN001
-    rejected = RefinementResult.rejected(
-        RefinementRequest(RAW),
-        refined_text="我们下周五交三个报告。",
-        issues=(FidelityIssue("not_a_subsequence", "结果包含原文没有的内容"),),
+def test_a_noted_refinement_is_shown_with_the_note(window) -> None:  # noqa: ANN001
+    """The reverse of what this used to assert. Withholding the refinement and putting
+    the transcript in its place is what made three reports read as "the model just
+    repeated my text" — and there is nobody to protect, since both panes are on screen
+    and the user copies deliberately. The note points; it does not withhold.
+    """
+    noted = RefinementResult(
+        raw_text=RAW,
+        refined_text="我们下周五交五个报告。",
+        mode=RefinementMode.CONSERVATIVE,
+        notes=(Note("number_new", "结果里的数字原文中没有：['5']"),),
     )
-    window._refined(rejected)
+    window._refined(noted)
 
-    shown = window.refined_text.toPlainText()
-    assert shown == RAW, "the model's version must not reach the pane"
-    assert "下周五" not in shown
-    assert "未通过校验" in window.refine_status.text()
-    assert "原文没有的内容" in window.refine_status.text()
+    assert window.refined_text.toPlainText() == "我们下周五交五个报告。"
+    assert "['5']" in window.refine_status.text(), "the number change is pointed at"
 
 
 def test_an_accepted_refinement_is_shown_beside_the_original(window) -> None:  # noqa: ANN001
@@ -100,7 +103,7 @@ def test_the_refined_pane_is_read_only(window) -> None:  # noqa: ANN001
 def test_an_unavailable_service_explains_itself(window) -> None:  # noqa: ANN001
     result = window.context.refine(RefinementRequest(RAW))
 
-    assert not result.accepted
+    assert not result.ok
     assert result.text == RAW
     window._refined(result)
     assert "未配置计算节点" in window.refine_status.text()
@@ -149,9 +152,9 @@ def test_a_crashing_refinement_still_reports_something(qt_app) -> None:
     thread.run()
 
     assert len(received) == 1
-    assert not received[0].accepted
+    assert not received[0].ok
     assert received[0].text == RAW
-    assert "整理失败" in received[0].errors[0].detail
+    assert "整理失败" in received[0].failure
 
 
 def test_saving_writes_the_transcript_alongside_the_refinement(  # noqa: ANN001

@@ -22,7 +22,6 @@ from localasr.node.companion import NodeCompanion
 from localasr.refine import host
 from localasr.refine.node_client import NodeRefiner
 from localasr.refine.types import (
-    FidelityIssue,
     RefinementMode,
     RefinementRequest,
     RefinementResult,
@@ -100,11 +99,10 @@ class Settings:
     refine_instruction: str = ""
     """The user's standing refinement request, in their own words.
 
-    Empty means conservative cleaning — punctuation and filler removal, with the
-    subsequence proof behind it. Anything else switches to a custom instruction, where
-    that proof does not hold and only risk screening remains. Persisted because most
-    people want the same thing every time, and retyping it is friction on the one
-    action they take most.
+    Empty means correction only: fix what recognition misheard, punctuate, drop filler,
+    keep the meaning and the order. Anything else switches to a custom instruction, where
+    the model also restructures. Persisted because most people want the same thing every
+    time, and retyping it is friction on the one action they take most.
     """
 
     local_asr_fallback: bool = True
@@ -321,15 +319,8 @@ class AppContext:
                 return service.refine(request)
 
         if not self.can_refine:
-            return RefinementResult.rejected(
-                request,
-                refined_text="",
-                issues=(
-                    FidelityIssue(
-                        "unavailable",
-                        "未配置计算节点。在 config.toml 设置 node_url 后才能整理文本。",
-                    ),
-                ),
+            return RefinementResult.failed(
+                request, "未配置计算节点。在 config.toml 设置 node_url 后才能整理文本。"
             )
         token = self.settings.node_token or os.environ.get("LOCALASR_NODE_TOKEN")
         with NodeRefiner(self.node_url, token=token) as refiner:

@@ -1,14 +1,15 @@
 """Domain objects for transcript refinement.
 
-The rule the whole module exists to enforce: **the raw transcript is evidence and is
-never overwritten.** A refinement is a separate artefact that points back at the
-utterances it came from, carries the model and template that produced it, and can always
-be discarded in favour of the original.
+The rule the module exists to enforce: **the raw transcript is evidence and is never
+overwritten.** A refinement is a separate artefact that points back at the utterances it
+came from and carries the model and template that produced it, so the two can always be
+read against each other.
 
-That matters because a language model asked to "tidy this up" will, unprompted, supply
-causal links that were never spoken, correct numbers it thinks are wrong, normalise
-proper nouns, and merge two statements that only sound alike. A prompt cannot prevent
-this; only keeping the original and checking the output against it can.
+Kept, not gated. There used to be a validator here that could refuse a refinement and
+show the transcript in its place. It was removed: substitution is what makes refinement
+worth having on speech — recognition returns homophones, and inferring the intended word
+from a wrong one that sounds like it is the main job — while the interface keeps both
+texts on screen for a person who is watching the whole time anyway. See `review.py`.
 """
 
 from __future__ import annotations
@@ -25,43 +26,32 @@ class RefinementMode(StrEnum):
     """
 
     CONSERVATIVE = "conservative"
-    """Punctuation, paragraphing, filler removal, adjacent duplicate removal. Nothing
-    else: order is preserved and no word is substituted. This is verifiable — the output
-    must be a subsequence of the input."""
+    """Punctuation, paragraphing, filler removal, and correcting words recognition
+    clearly misheard. Meaning and order are kept; nothing is summarised or restructured.
+
+    Substitution is allowed on purpose. A transcript is full of homophones, and refusing
+    to fix them was refusing the most useful thing this mode can do."""
 
     CUSTOM = "custom"
     """Whatever the user asked for, in their own words.
 
-    Summarise, extract action items, rewrite as a brief — all legitimate, none of them
-    a subsequence of the transcript, so the proof that holds for conservative cleaning
-    does not apply here and cannot be made to. Only risk screening remains, and the
-    interface has to say so: the original stays on screen and the user decides.
+    Summarise, extract action items, rewrite as a brief. The original stays on screen
+    beside it and the user decides.
     """
 
     PROMPT = "prompt"
-    """Restructure the speech into a task/background/constraints brief. Reordering is
-    expected, so subsequence checking does not apply and only the fact-level invariants
-    can be enforced."""
-
-
-class Severity(StrEnum):
-    ERROR = "error"
-    """The refinement is unusable and the raw transcript is shown instead. Never
-    "show it anyway with a warning" — a plausible-looking wrong number is worse than
-    visibly unpolished text."""
-
-    WARNING = "warning"
-    """Surfaced to the user, refinement still offered."""
+    """Restructure the speech into a task/background/constraints brief."""
 
 
 @dataclass(frozen=True, slots=True)
-class FidelityIssue:
+class Note:
+    """Something worth a second look. Never a reason to withhold the refinement."""
+
     kind: str
     detail: str
-    severity: Severity = Severity.ERROR
 
     def __str__(self) -> str:
-        return f"[{self.severity.value}] {self.kind}: {self.detail}"
+        return f"{self.kind}: {self.detail}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,51 +77,43 @@ class RefinementRequest:
 
 @dataclass(frozen=True, slots=True)
 class RefinementResult:
-    """A refinement plus everything needed to distrust it.
+    """A refinement, the transcript it came from, and what produced it.
 
-    `accepted` is False when validation rejected the model's output. The object is still
-    returned, carrying `issues`, so the interface can explain why the user is looking at
-    the raw text — silence would read as the feature being broken.
+    `failure` separates the two things that used to be conflated under "not accepted":
+    a refinement that did not happen at all — no refiner configured, the request failed —
+    from one that happened and might be imperfect. Only the first has nothing to show, and
+    only the first falls back to the transcript.
     """
 
     raw_text: str
     refined_text: str
     mode: RefinementMode
     source_segment_ids: tuple[str, ...] = ()
-    issues: tuple[FidelityIssue, ...] = ()
+    notes: tuple[Note, ...] = ()
+    """Advisory, always. Nothing here withholds the refinement."""
+
     model_id: str = ""
     model_revision: str = ""
     template_revision: str = ""
-    accepted: bool = True
+    failure: str | None = None
+    """Why no refinement exists, when none does."""
 
     @property
-    def errors(self) -> tuple[FidelityIssue, ...]:
-        return tuple(issue for issue in self.issues if issue.severity is Severity.ERROR)
-
-    @property
-    def warnings(self) -> tuple[FidelityIssue, ...]:
-        return tuple(issue for issue in self.issues if issue.severity is Severity.WARNING)
+    def ok(self) -> bool:
+        return self.failure is None
 
     @property
     def text(self) -> str:
-        """What to show. Falls back to the raw transcript whenever validation failed."""
-        return self.refined_text if self.accepted else self.raw_text
+        """What to show: the refinement, or the transcript when there is no refinement."""
+        return self.raw_text if self.failure else self.refined_text
 
     @classmethod
-    def rejected(
-        cls,
-        request: RefinementRequest,
-        refined_text: str,
-        issues: tuple[FidelityIssue, ...],
-        **provenance: str,
-    ) -> RefinementResult:
+    def failed(cls, request: RefinementRequest, reason: str, **provenance: str) -> RefinementResult:
         return cls(
             raw_text=request.raw_text,
-            refined_text=refined_text,
+            refined_text="",
             mode=request.mode,
             source_segment_ids=request.source_segment_ids,
-            issues=issues,
-            accepted=False,
+            failure=reason,
             **provenance,
         )
-

@@ -14,10 +14,9 @@ import pytest
 from localasr.apps.journal import SCHEMA_VERSION, Journal, JournalHeader
 from localasr.core.types import Segment, Span
 from localasr.refine.types import (
-    FidelityIssue,
+    Note,
     RefinementMode,
     RefinementResult,
-    Severity,
 )
 
 
@@ -45,17 +44,17 @@ def _segment(index: int) -> Segment:
     )
 
 
-def _refinement(*ids: str, accepted: bool = True) -> RefinementResult:
+def _refinement(*ids: str, failure: str | None = None) -> RefinementResult:
     return RefinementResult(
         raw_text="嗯第0句",
         refined_text="第0句。",
         mode=RefinementMode.CONSERVATIVE,
         source_segment_ids=ids,
-        issues=() if accepted else (FidelityIssue("number_lost", "数字消失"),),
+        notes=() if failure else (Note("number_new", "结果里的数字原文中没有：['5']"),),
         model_id="qwen3_5-2b-refiner-q4",
         model_revision="d7f544ee",
         template_revision="2026-08-11.1",
-        accepted=accepted,
+        failure=failure,
     )
 
 
@@ -75,7 +74,7 @@ def test_segments_and_refinements_both_survive_a_restart(tmp_path) -> None:  # n
 
     assert [s.text for s in state.segments] == ["第0句", "第1句"]
     assert len(state.refinements) == 1
-    assert state.refinements[0].accepted
+    assert state.refinements[0].ok
 
 
 def test_only_unrefined_utterances_are_redone(tmp_path) -> None:  # noqa: ANN001
@@ -152,15 +151,15 @@ def test_a_rejected_refinement_is_recorded_so_it_is_not_retried_forever(tmp_path
     with Journal(path, _header()) as journal:
         journal.open(resume=False)
         journal.append(_segment(0))
-        journal.append_refinement(_refinement("u0", accepted=False))
+        journal.append_refinement(_refinement("u0", failure="节点不可达"))
 
     state = Journal(path, _header()).resume_state()
     stored = state.refinements[0]
 
-    assert not stored.accepted
+    assert not stored.ok
     assert stored.text == stored.raw_text, "a rejected refinement still shows the original"
-    assert stored.errors[0].kind == "number_lost"
-    assert stored.errors[0].severity is Severity.ERROR
+    assert stored.failure == "节点不可达"
+    assert stored.failure == "节点不可达"
     assert state.pending_refinement_ids() == (), "tried and refused is not pending"
 
 
@@ -205,7 +204,7 @@ def test_a_meeting_journal_round_trips_refinements(tmp_path) -> None:  # noqa: A
          "source": "mic", "utterance_id": "u0"},
         {"type": "segment", "start": 2.0, "end": 3.5, "text": "第1句",
          "source": "system", "utterance_id": "u1"},
-        {"type": "refinement", "status": "completed", "accepted": True,
+        {"type": "refinement", "status": "completed", "failure": None,
          "mode": "conservative", "source_segment_ids": ["u0"],
          "raw_text": "嗯第0句", "refined_text": "第0句。", "issues": [],
          "model_id": "r", "model_revision": "rev", "template_revision": "tpl"},
@@ -235,7 +234,7 @@ def test_a_meeting_refinement_row_is_not_mistaken_for_a_segment(tmp_path) -> Non
         json.dumps({"schema": 2, "started_at": "2026-08-11T15:00:00", "sources": []})
         + "\n"
         + json.dumps(
-            {"type": "refinement", "accepted": True, "mode": "conservative",
+            {"type": "refinement", "failure": None, "mode": "conservative",
              "source_segment_ids": [], "raw_text": "原", "refined_text": "整理"},
             ensure_ascii=False,
         )

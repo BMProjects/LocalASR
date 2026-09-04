@@ -282,9 +282,9 @@ def test_a_model_that_cannot_load_is_a_refusal_not_a_500(monkeypatch) -> None:  
 
     assert response.status_code == 200, "a load failure is not a server fault"
     body = response.json()
-    assert body["accepted"] is False
+    assert body["failure"]
     assert body["text"] == "原始内容", "the original must come back"
-    assert any("无法加载整理模型" in i["detail"] for i in body["issues"])
+    assert "无法加载整理模型" in body["failure"]
 
 
 # --- dual residency, decided by measured arithmetic ----------------------------
@@ -548,13 +548,13 @@ def test_a_configured_refiner_is_used_directly_not_through_the_asr_node(monkeypa
     result = context.refine(RefinementRequest("嗯我们下周交"))
 
     assert "127.0.0.1:8888" in seen["url"], "must not go via the ASR node"
-    assert result.accepted
+    assert result.ok
     assert result.model_id == "Qwen3.5-4B-Q4_K_M", "the journal needs the real weights"
 
 
-def test_refinement_output_is_validated_wherever_it_came_from(monkeypatch) -> None:  # noqa: ANN001
-    """A refiner reached directly is still a model server answering over HTTP. Nothing
-    it returns may skip the checks against the original."""
+def test_refinement_output_is_reviewed_wherever_it_came_from(monkeypatch) -> None:  # noqa: ANN001
+    """A refiner reached directly is still a model server answering over HTTP, and its
+    output is reviewed the same way — advisory notes, never withheld."""
     import json as _json
 
     import httpx
@@ -574,8 +574,8 @@ def test_refinement_output_is_validated_wherever_it_came_from(monkeypatch) -> No
 
     result = context.refine(RefinementRequest("嗯我们下周交三个报告"))
 
-    assert not result.accepted
-    assert result.text == "嗯我们下周交三个报告", "the invented date must not be shown"
+    assert result.ok
+    assert result.text == "我们下周五交三个报告。", "the refinement is what was asked for"
 
 
 def test_local_asr_is_not_started_behind_a_resident_refiner(monkeypatch) -> None:  # noqa: ANN001
