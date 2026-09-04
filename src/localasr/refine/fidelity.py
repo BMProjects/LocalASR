@@ -192,16 +192,39 @@ def validate(raw: str, refined: str, mode: RefinementMode) -> tuple[FidelityIssu
         issues.append(FidelityIssue("number_invented", f"出现了原文没有的数字：{sorted(added)}"))
 
     raw_negations, refined_negations = _negations(raw), _negations(refined)
-    if missing := raw_negations - refined_negations:
+    gone = raw_negations - refined_negations
+    new = refined_negations - raw_negations
+    # Rewording a negation is not inventing one. A rewrite that turns 「没有办法」 into
+    # 「无法」 has the same polarity and different characters, and comparing the
+    # characters made every such paraphrase read as fabrication — which is what a rewrite
+    # is *for*, so refinement kept getting rejected and the pane kept falling back to the
+    # original. Measured on real output: 2 of 4 summaries died this way.
+    #
+    # What the check was always trying to establish is whether a denial appeared from
+    # nowhere. That question is answered by whether the source denied anything at all, so
+    # it is asked that way now. When both sides negate, the substitution is reported —
+    # loudly enough to read, not loudly enough to throw the result away.
+    reworded = rewriting and gone and new and raw_negations and refined_negations
+    if reworded:
         issues.append(
             FidelityIssue(
-                "negation_lost", f"否定词消失，语义可能反转：{sorted(missing)}", lost
+                "negation_reworded",
+                f"否定词换了说法（{sorted(gone)} → {sorted(new)}），"
+                "极性大概率不变，但作用范围可能不同，请核对",
+                Severity.WARNING,
             )
         )
-    if added := refined_negations - raw_negations:
-        issues.append(
-            FidelityIssue("negation_invented", f"出现了原文没有的否定词：{sorted(added)}")
-        )
+    else:
+        if gone:
+            issues.append(
+                FidelityIssue(
+                    "negation_lost", f"否定词消失，语义可能反转：{sorted(gone)}", lost
+                )
+            )
+        if new:
+            issues.append(
+                FidelityIssue("negation_invented", f"出现了原文没有的否定词：{sorted(new)}")
+            )
 
     raw_tokens, refined_tokens = _ascii_tokens(raw), _ascii_tokens(refined)
     if missing := raw_tokens - refined_tokens:
