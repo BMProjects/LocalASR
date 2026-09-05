@@ -177,14 +177,21 @@ def test_a_bound_server_reports_a_url_a_client_can_actually_use() -> None:
     assert engine.base_url == "http://127.0.0.1:8091"
 
 
-def test_a_token_reaches_llama_server_as_an_api_key() -> None:
+def test_a_token_reaches_llama_server_as_an_api_key(monkeypatch) -> None:  # noqa: ANN001
     """Refusing to bind without one would be theatre if it were never passed on."""
     from pathlib import Path
 
+    from localasr.core.engine import supervisor as supervisor_module
     from localasr.core.engine.supervisor import EngineSupervisor
     from localasr.registry import manager
     from localasr.registry.manager import ModelKind
 
+    # What is under test is the command, not this machine's tooling: the binary need not
+    # exist for the arguments around it to be right, and requiring one made the test fail
+    # on a machine that had moved its refinement to an external server.
+    monkeypatch.setattr(
+        supervisor_module, "find_llama_server", lambda: Path("/opt/llama.cpp/llama-server")
+    )
     spec = manager.get_model("qwen3_5-4b-refiner-q4", ModelKind.LLM)
     engine = EngineSupervisor(spec, port=8091, bind="0.0.0.0", api_key="s3cret")
     command = engine._command(Path("/m.gguf"), None)

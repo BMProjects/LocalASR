@@ -1,6 +1,7 @@
 """A pass/fail gate on whether a refiner model is usable at all.
 
-Skipped unless `LOCALASR_REFINER_URL` points at a running llama-server, because it needs
+Skipped unless `LOCALASR_REFINER_URL` points at a running refiner — llama-server or
+LM Studio on 1234, anything serving `/v1/chat/completions` — because it needs
 a real model — but it is a test rather than a script so the bar cannot quietly drift.
 
 The gate exists because "the refinement looked fine" is not a finding. Qwen3.5-2B under
@@ -8,7 +9,7 @@ the first prompt copied the prompt's own scaffolding into every answer; under th
 it scored 19/20 on this set with none. That is the difference between a model being
 unusable and usable, and one hand-picked sentence could not have told them apart.
 
-    LOCALASR_REFINER_URL=http://127.0.0.1:48459 uv run pytest tests/test_refiner_quality.py
+    LOCALASR_REFINER_URL=http://127.0.0.1:1234 uv run pytest tests/test_refiner_quality.py
 """
 
 from __future__ import annotations
@@ -25,7 +26,9 @@ from localasr.refine.types import RefinementMode
 from tests.fixtures.refinement_cases import CASES
 
 URL = os.environ.get("LOCALASR_REFINER_URL")
-pytestmark = pytest.mark.skipif(not URL, reason="set LOCALASR_REFINER_URL to a llama-server")
+pytestmark = pytest.mark.skipif(
+    not URL, reason="set LOCALASR_REFINER_URL to a running refiner (e.g. LM Studio on 1234)"
+)
 
 MIN_PASSING = 19
 """Out of 20. One failure is tolerated because the validator catches it and the raw text

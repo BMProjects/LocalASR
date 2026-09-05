@@ -124,8 +124,14 @@ class ChatCompletionClient:
             },
             "json_schema": RESPONSE_SCHEMA,
             # Qwen3 emits reasoning blocks unless told otherwise; they are pure cost
-            # here and would land inside the JSON payload.
+            # here and would land inside the JSON payload. Two spellings because two
+            # servers: llama-server honours the template kwarg, LM Studio ignores it and
+            # honours `reasoning_effort`. Measured against LM Studio 0.4.23 serving
+            # Qwen3.5-4B — with only the kwarg, every answer came back with an empty
+            # `content`, the whole budget spent in `reasoning_content`, and refinement
+            # failed as "model did not return JSON".
             "chat_template_kwargs": {"enable_thinking": False},
+            "reasoning_effort": "none",
         }
 
         try:

@@ -318,3 +318,34 @@ class TestThroughTheApplication:
         context = AppContext(settings=Settings(refiner_url=None))
         assert context.lmstudio() is None
         assert context.refiner_managed and context.refiner_controllable
+
+
+def test_reasoning_is_turned_off_in_a_way_lm_studio_honours() -> None:
+    """Measured against LM Studio 0.4.23 serving Qwen3.5-4B, not read off a page.
+
+    `chat_template_kwargs.enable_thinking` is what llama-server honours, and LM Studio
+    ignores it silently: every answer came back with `content: ""`, the entire token
+    budget spent in `reasoning_content`, and refinement failed as "model did not return
+    JSON". `reasoning_effort: "none"` was the spelling that produced content. Both are
+    sent, because both servers are in use.
+    """
+    from localasr.refine.client import ChatCompletionClient
+    from localasr.refine.types import RefinementRequest
+
+    sent: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": json.dumps({"refined_text": "好。"})}}],
+                "model": "qwen3.5-4b-mtp",
+            },
+        )
+
+    client = ChatCompletionClient(URL, client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client.refine(RefinementRequest(raw_text="呃那个好的"))
+
+    assert sent["reasoning_effort"] == "none", "LM Studio honours this one"
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False}, "llama-server that one"
