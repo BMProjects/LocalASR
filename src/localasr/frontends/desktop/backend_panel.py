@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from localasr.context import AppContext
 from localasr.frontends.desktop.theme import set_tone
+from localasr.refine.lmstudio import LMStudioCompanion
 from localasr.registry import imported
 from localasr.registry.manager import ModelKind
 
@@ -91,6 +92,14 @@ def _probe_refiner(context: AppContext) -> BackendStatus:
         return BackendStatus(
             "未配置", "设置 refiner_url 或 refiner_model_id 后才能整理文本", "warning"
         )
+
+    # This probe runs on a worker thread, which is the only place the LM Studio
+    # detection can afford to happen — it is an HTTP request, and the answer decides
+    # whether the load/unload buttons mean anything.
+    companion = context.lmstudio()
+    if companion is not None:
+        return _probe_lmstudio(companion)
+
     try:
         with httpx.Client(timeout=PROBE_TIMEOUT) as client:
             if client.get(f"{url}/health").status_code != 200:
@@ -98,6 +107,19 @@ def _probe_refiner(context: AppContext) -> BackendStatus:
         return BackendStatus("就绪", f"{url} · {context.settings.refiner_model}", "success")
     except httpx.HTTPError as exc:
         return BackendStatus("不可达", f"{url}（{type(exc).__name__}）", "danger")
+
+
+def _probe_lmstudio(companion: LMStudioCompanion) -> BackendStatus:
+    """LM Studio answers "what is loaded", so say that rather than only "reachable"."""
+    try:
+        resident = companion.resident()
+    except (httpx.HTTPError, ValueError) as exc:
+        return BackendStatus("不可达", f"{companion.url}（{type(exc).__name__}）", "danger")
+    if resident:
+        return BackendStatus("就绪", f"LM Studio · {'、'.join(resident)} 已加载", "success")
+    # Not a fault: LM Studio loads on demand, so an empty server still refines — the
+    # first request just pays for the load. Same reading as the node's 503.
+    return BackendStatus("待命", f"LM Studio {companion.url} · 点「启动」预加载", "active")
 
 
 class _NodeActionThread(QThread):
@@ -257,12 +279,10 @@ class BackendPanel(QFrame):
         self.refiner_load_button.clicked.connect(lambda: self._refiner_action("load"))
         self.refiner_unload_button.clicked.connect(lambda: self._refiner_action("release"))
         if not context.refiner_managed:
-            for button in (self.refiner_load_button, self.refiner_unload_button):
-                button.setEnabled(False)
-                button.setToolTip(
-                    "整理服务由外部管理（config.toml 设置了 refiner_url），"
-                    "启停请用 systemctl 或启动它的方式。"
-                )
+            # Disabled until the first probe says otherwise. Whether an external server
+            # can be driven from here is an HTTP question, and asking it in a
+            # constructor would block the window from appearing.
+            self._set_refiner_controls(controllable=False)
         # Import lands in this machine's catalog, which is where the refiner reads from.
         self.import_button = QPushButton("导入模型…")
         self.import_button.setToolTip(
@@ -325,7 +345,7 @@ class BackendPanel(QFrame):
         self._release_thread.start()
 
     def _refiner_action(self, action: str) -> None:
-        if self._release_thread is not None or not self.context.refiner_managed:
+        if self._release_thread is not None or not self.context.refiner_controllable:
             return
         if action == "release" and self.context.coordinator.active():
             self._report("请先停止正在进行的识别或会议。")
@@ -418,7 +438,7 @@ class BackendPanel(QFrame):
     def _set_actions_enabled(self, enabled: bool) -> None:
         for button in (self.asr_load_button, self.release_button, self.import_button):
             button.setEnabled(enabled)
-        if self.context.refiner_managed:
+        if self.context.refiner_controllable:
             self.refiner_load_button.setEnabled(enabled)
             self.refiner_unload_button.setEnabled(enabled)
 
@@ -441,6 +461,9 @@ class BackendPanel(QFrame):
         self._probe.start()
 
     def _show(self, asr: BackendStatus, refiner: BackendStatus) -> None:
+        # The probe is what discovers an external server that can be driven from here,
+        # so this is the first moment the buttons can be right.
+        self._set_refiner_controls(self.context.refiner_controllable)
         # Broadcast for a collapsed header: folding setup away must not fold away the
         # answer to "is it working".
         self.summary.emit(f"识别 {asr.label} · 整理 {refiner.label}")
@@ -452,6 +475,21 @@ class BackendPanel(QFrame):
             set_tone(pill, status.tone)
             detail.setText(status.detail)
             detail.setToolTip(status.detail)
+
+    def _set_refiner_controls(self, controllable: bool) -> None:
+        """Whether the refiner buttons do anything, and why not when they do not."""
+        if self._release_thread is not None:
+            # An action is in flight and owns these buttons. The periodic probe must not
+            # re-enable them under it.
+            return
+        for button in (self.refiner_load_button, self.refiner_unload_button):
+            button.setEnabled(controllable)
+            button.setToolTip(
+                "加载整理模型到显存，或把显存还回去。"
+                if controllable
+                else "整理服务由外部管理（config.toml 设置了 refiner_url），"
+                "启停请用 systemctl 或启动它的方式。"
+            )
 
     def _finished(self) -> None:
         self._probe = None

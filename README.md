@@ -172,9 +172,14 @@ starting a second one.
 
 ```toml
 node_url    = "http://asr-node.local:8090"   # audio; omit to run ASR locally
-refiner_url = "http://127.0.0.1:8091"        # text; omit and the app runs its own
+refiner_url = "http://127.0.0.1:1234"        # text; omit and the app runs its own
 local_asr_fallback = false
 ```
+
+An external refiner is normally read-only from the application — a URL is not a process.
+LM Studio is the exception: it exposes model residency through `/api/v1/models/{load,
+unload}`, so the load and unload controls keep working against it, and the model is
+handed back when the window closes. It is detected, not configured.
 
 Splitting the two backends across machines is a deployment choice, not a mode — see
 [deploy/README-node.md](deploy/README-node.md), which also carries the measured numbers
@@ -184,7 +189,7 @@ board had to swap models between roles).
 ## Development
 
 ```bash
-uv run pytest        # 540 tests, no GPU and no model weights required
+uv run pytest        # 572 tests, no GPU and no model weights required
 uv run ruff check .
 ```
 

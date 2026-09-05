@@ -54,7 +54,10 @@ class _BackendStarter(QThread):
                 self._context.start_node()
             except Exception as exc:  # noqa: BLE001 - never take the host down for this
                 print(f"识别节点未能就绪：{exc}", file=sys.stderr)
-        if self._context.refiner_managed:
+        # `lmstudio()` is the probe as well as the accessor, and this thread is where
+        # it belongs: an external refiner that can be loaded gets warmed at launch and
+        # unloaded at exit exactly like the one we spawn.
+        if self._context.refiner_managed or self._context.lmstudio() is not None:
             try:
                 self._context.start_refiner()
             except Exception as exc:  # noqa: BLE001

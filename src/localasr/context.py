@@ -20,6 +20,7 @@ from localasr.apps.events import ModelChanged, ModelDownloaded
 from localasr.core.engine.manager import EngineManager
 from localasr.node.companion import NodeCompanion
 from localasr.refine import host
+from localasr.refine.lmstudio import LMStudioCompanion, speaks_lmstudio
 from localasr.refine.node_client import NodeRefiner
 from localasr.refine.types import (
     RefinementMode,
@@ -31,6 +32,16 @@ from localasr.registry.manager import ModelSpec
 
 if TYPE_CHECKING:
     from localasr.core.audio.vad import SileroVad, VadConfig
+
+
+DEFAULT_REFINER_MODEL = "localasr-refiner"
+"""The name sent to a refiner that does not route on it — a label, not a model key.
+
+Named because two places have to agree on it: the setting's default, and the check that
+keeps it from being handed to LM Studio as a model to load. `Settings.refiner_model` is
+not readable as a class attribute (the dataclass has slots), and comparing against the
+literal in two files is how they drift apart.
+"""
 
 
 @dataclass(slots=True)
@@ -94,9 +105,21 @@ class Settings:
     `refiner_url` instead to point at one somebody else runs — LM Studio, a
     llama-server under systemd — and it becomes read-only from here.
     """
-    refiner_model: str = "localasr-refiner"
+    refiner_model: str = DEFAULT_REFINER_MODEL
     """Model name sent to the refiner. LM Studio and llama-server both echo it, and
-    it is what the journal records — so it should name the actual weights."""
+    it is what the journal records — so it should name the actual weights.
+
+    Against LM Studio this doubles as the model *key* — ``unsloth/Qwen3.5-4B-MTP-GGUF``
+    — because that server routes on it. Leave it alone and the one LLM LM Studio has is
+    used; set it when there are several."""
+
+    refiner_release_on_exit: bool = True
+    """Unload an external refiner when the session ends, even one found already loaded.
+
+    Only reaches a server that exposes residency — LM Studio does; a bare llama-server
+    has nothing to unload short of killing it. Off is for an LM Studio somebody else is
+    also using, where its chat window would lose its model when this window closes.
+    """
 
     refine_instruction: str = ""
     """The user's standing refinement request, in their own words.
@@ -182,6 +205,8 @@ class AppContext:
     _engine: EngineManager | None = field(default=None, init=False, repr=False)
     _refiner: host.Companion | None = field(default=None, init=False, repr=False)
     _node: NodeCompanion | None = field(default=None, init=False, repr=False)
+    _lmstudio: LMStudioCompanion | None = field(default=None, init=False, repr=False)
+    _lmstudio_probed: bool = field(default=False, init=False, repr=False)
 
     @property
     def spec(self) -> ModelSpec:
@@ -229,7 +254,43 @@ class AppContext:
 
     @property
     def refiner_loaded(self) -> bool:
+        if self._lmstudio is not None:
+            return bool(self._lmstudio.resident())
         return self._refiner is not None and self._refiner.running
+
+    def lmstudio(self) -> LMStudioCompanion | None:
+        """The companion for `refiner_url`, when that URL is an LM Studio server.
+
+        Probed once, off the UI thread — the panel's periodic refresh already runs there
+        and is the first thing to ask. A settings flag would have been one more thing for
+        the user to know, and `/api/v1/models` answers it without being told.
+        """
+        url = self.settings.refiner_url
+        if not url:
+            return None
+        if not self._lmstudio_probed:
+            self._lmstudio_probed = True
+            if speaks_lmstudio(url, self.settings.refiner_token):
+                self._lmstudio = LMStudioCompanion(
+                    url,
+                    token=self.settings.refiner_token,
+                    model=(
+                        self.settings.refiner_model
+                        if self.settings.refiner_model != DEFAULT_REFINER_MODEL
+                        else None
+                    ),
+                    release_on_exit=self.settings.refiner_release_on_exit,
+                )
+        return self._lmstudio
+
+    @property
+    def refiner_controllable(self) -> bool:
+        """Whether the start/unload buttons can do anything.
+
+        Two different mechanisms, one question. Spawning a child is not the only way to
+        own a model's lifetime; a server that exposes load and unload hands it over too.
+        """
+        return self.refiner_managed or self._lmstudio is not None
 
     def start_node(self) -> str:
         """Make the recognition node ready for this session.
@@ -265,7 +326,10 @@ class AppContext:
         makes the systemd deployment and this one the same thing at different lifetimes.
         """
         if not self.refiner_managed:
-            raise RuntimeError("整理服务由外部管理，无法从这里启动")
+            companion = self.lmstudio()
+            if companion is None:
+                raise RuntimeError("整理服务由外部管理，无法从这里启动")
+            return companion.start()
         if self._refiner is None:
             self._refiner = host.Companion(
                 model_id=self.settings.refiner_model_id,
@@ -274,7 +338,13 @@ class AppContext:
         return self._refiner.start()
 
     def stop_refiner(self) -> None:
-        """Stop the refinement module, which releases the model's memory."""
+        """Release the refinement model, however this session got hold of one.
+
+        Killing our own child and asking LM Studio to unload are the same act at the
+        same moment: the ~2.9 GB a 4B Q4 holds goes back. Only the mechanism differs.
+        """
+        if self._lmstudio is not None:
+            self._lmstudio.stop()
         if self._refiner is None:
             return
         self._refiner.stop()

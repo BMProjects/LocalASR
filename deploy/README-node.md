@@ -226,13 +226,35 @@ Set `refiner_url` instead to point at a server somebody else runs — LM Studio,
 llama-server under systemd. It then becomes read-only from the frontend, and the buttons
 say so rather than doing nothing.
 
-For LM Studio that is `refiner_url = "http://127.0.0.1:1234"` — no `/v1`, the client
-appends it. Its defaults here (`~/.lmstudio/.internal/http-server-config.json`) are the
-right ones: port 1234, `networkInterface: 127.0.0.1`, and `justInTimeModelLoading`, which
-loads the weights on the first request so nothing has to be loaded by hand first. Two
-things it does not do by default: `autoStartOnLaunch` is off, so the server has to be
-started once per LM Studio run, and it holds the model until told otherwise — the
-application's own release button cannot reach a server it does not own.
+### LM Studio
+
+`refiner_url = "http://127.0.0.1:1234"` — no `/v1`, the client appends it. Its defaults
+(`~/.lmstudio/.internal/http-server-config.json`) are the right ones: port 1234,
+`networkInterface: 127.0.0.1`, and `justInTimeModelLoading`, which loads the weights on
+the first request. `autoStartOnLaunch` is off, so the server still has to be started once
+per run — `lms server start`, or Developer → Start Server.
+
+LM Studio is the one external refiner the 「启动」/「卸载」 buttons still work for, because
+it exposes residency as part of its API rather than as an implementation detail:
+
+    GET  /api/v1/models          every downloaded model, and its `loaded_instances`
+    POST /api/v1/models/load     {"model": "<key>"}
+    POST /api/v1/models/unload   {"instance_id": "<id>"}
+
+Which is the same shape as this node's own load/release, so it is driven by the same kind
+of object. Nothing has to be configured for it: `GET /api/v1/models` is what identifies an
+LM Studio, and llama-server answers 404 there. Two settings exist only for the cases the
+probe cannot decide:
+
+- `refiner_model` doubles as the model **key** here (`unsloth/Qwen3.5-4B-MTP-GGUF`), for
+  when LM Studio has more than one LLM. Left at its default it is a label, not a key, and
+  is not sent as one.
+- `refiner_release_on_exit = false` for an LM Studio whose own chat window is in use —
+  otherwise closing this window takes its model with it.
+
+JIT loading means the buttons are about latency, not correctness: refinement works either
+way, but nothing except this application will unload the model afterwards, and a 4B Q4
+holds ~2.9 GB of a 4 GB card until something does.
 
 ## `--no-dev` belongs on every uv command
 
