@@ -25,7 +25,7 @@ else that speaks the same protocol — by changing a URL.
 Two decisions drive everything else.
 
 **The engine boundary is a protocol, not a plugin interface.** Every runtime worth using
-— llama-server, Unsloth Studio, whisper.cpp's server — already speaks
+— llama-server, LM Studio, whisper.cpp's server — already speaks
 `/v1/audio/transcriptions` and `/v1/chat/completions`. Writing an adapter layer per
 backend would have re-implemented that agreement badly. So there is one HTTP client and
 one process supervisor, and swapping models or machines is configuration.
@@ -143,7 +143,7 @@ abstract.
 
 ### Using a model you already have
 
-Weights managed by another tool — Unsloth Studio, an existing Hugging Face cache — can be
+Weights managed by another tool — LM Studio, an existing Hugging Face cache — can be
 linked instead of copied:
 
 ```bash

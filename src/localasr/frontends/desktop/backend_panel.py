@@ -340,8 +340,11 @@ class BackendPanel(QFrame):
     def _import(self) -> None:
         if self._import_thread is not None:
             return
+        # Opened where the weights actually are. A store path is several levels deep and
+        # partly hashes, so starting at $HOME made the common case the longest one.
+        start = imported.store_root() or Path.home()
         model_file, _ = QFileDialog.getOpenFileName(
-            self, "选择模型文件（.gguf）", str(Path.home()), "GGUF 模型 (*.gguf)"
+            self, "选择模型文件（.gguf）", str(start), "GGUF 模型 (*.gguf)"
         )
         if not model_file:
             return
@@ -371,7 +374,10 @@ class BackendPanel(QFrame):
             )
 
         # Linking is offered rather than assumed: a copy keeps working after the user
-        # tidies up their downloads, which is why it stays the default here too.
+        # tidies up their downloads. But a file inside another tool's model store is not
+        # a download waiting to be tidied — that tool is what keeps it — so there the
+        # default flips and the reason is named instead of hypothesised.
+        owner = imported.in_store(Path(model_file))
         link = (
             QMessageBox.question(
                 self,
@@ -379,9 +385,13 @@ class BackendPanel(QFrame):
                 f"「{Path(model_file).name}」约 "
                 f"{Path(model_file).stat().st_size / 1024**3:.1f} GB。\n\n"
                 "链接不占额外磁盘，但原文件被移动或删除后模型将无法加载。\n"
-                "如果这个文件由别的工具管理（例如 Unsloth Studio），链接更合适。",
+                + (
+                    f"这个文件在 {owner} 的模型库里，由它管理，建议链接。"
+                    if owner
+                    else "如果这个文件由别的工具管理（例如 LM Studio），链接更合适。"
+                ),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes if owner else QMessageBox.StandardButton.No,
             )
             == QMessageBox.StandardButton.Yes
         )

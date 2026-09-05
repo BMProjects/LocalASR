@@ -25,9 +25,9 @@ Measured end to end, warm, five consecutive runs:
 Against ~66 s for the same work with sequential loading on one board. The network carries
 a few hundred characters of text; it is not the cost.
 
-The desktop keeps the fidelity validator. Whatever a refiner returns — Unsloth Studio,
-llama-server, anything speaking the same protocol — is checked against the original here,
-so no backend can put unverified text in front of the user.
+The desktop keeps both texts. Whatever a refiner returns — LM Studio, llama-server,
+anything speaking the same protocol — is shown beside the transcript it came from rather
+than in place of it, so no backend can quietly replace what was said.
 
 ## Configuration
 
@@ -97,11 +97,12 @@ localasr-refiner --bind 0.0.0.0 --token "$(openssl rand -hex 16)"
 
 ### Using a model another tool already downloaded
 
-Weights managed by something else — Unsloth Studio, an existing HF cache — can be linked
+Weights managed by something else — LM Studio, an existing HF cache — can be linked
 instead of copied, which is what this machine does:
 
 ```bash
-localasr models import ~/.cache/huggingface/.../Qwen3.5-4B-UD-Q4_K_XL.gguf \
+localasr models import \
+    ~/.lmstudio/models/unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf \
     --link --kind llm --name qwen3_5-4b-unsloth
 ```
 
@@ -216,16 +217,22 @@ whole session and releasing the card afterwards, and a unit that comes up at boo
 stays up cannot do that.
 
 Uses the same GGUF the Orin was measured against — same hash, same prompt, comparable
-validator results. 2899 MiB of the 3050's 4096, with a desktop session running.
+output. 2899 MiB of the 3050's 4096, with a desktop session running.
 
 Vulkan compiles its shaders on the first request: ~28 s once, then a 0.9 s median. Warm
 it before judging any latency number.
 
-Set `refiner_url` instead to point at a server somebody else runs — Unsloth Studio, a
+Set `refiner_url` instead to point at a server somebody else runs — LM Studio, a
 llama-server under systemd. It then becomes read-only from the frontend, and the buttons
-say so rather than doing nothing. If you use Unsloth Studio, start it with
-`--disable-tools`: its search, Python and terminal tools run with the invoking user's
-rights, and refinement needs none of them.
+say so rather than doing nothing.
+
+For LM Studio that is `refiner_url = "http://127.0.0.1:1234"` — no `/v1`, the client
+appends it. Its defaults here (`~/.lmstudio/.internal/http-server-config.json`) are the
+right ones: port 1234, `networkInterface: 127.0.0.1`, and `justInTimeModelLoading`, which
+loads the weights on the first request so nothing has to be loaded by hand first. Two
+things it does not do by default: `autoStartOnLaunch` is off, so the server has to be
+started once per LM Studio run, and it holds the model until told otherwise — the
+application's own release button cannot reach a server it does not own.
 
 ## `--no-dev` belongs on every uv command
 

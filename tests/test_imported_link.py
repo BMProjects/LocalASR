@@ -123,3 +123,65 @@ def test_relinking_the_same_model_is_fine(tmp_path) -> None:  # noqa: ANN001
     spec = imported.import_model(ImportRequest(model_path=original, link=True))
 
     assert (manager.model_dir(spec) / spec.model.name).is_symlink()
+
+
+class TestKnownStores:
+    """Recognising another tool's model store.
+
+    Nothing is loaded from a store and nothing is searched for in one. The whole point
+    is to answer, from the path alone, the question the import flow otherwise puts to
+    the user: is this file managed by something that will keep it? That is the condition
+    under which linking is right, and getting it wrong copies several gigabytes onto the
+    same disk for nothing.
+    """
+
+    def test_the_first_store_present_is_where_the_file_dialog_opens(
+        self, tmp_path, monkeypatch  # noqa: ANN001
+    ) -> None:
+        absent, present = tmp_path / "gone", tmp_path / "lmstudio"
+        present.mkdir()
+        monkeypatch.setattr(
+            imported, "STORE_ROOTS", (("A", str(absent)), ("B", str(present)))
+        )
+        assert imported.store_root() == present
+
+    def test_no_store_is_not_an_error(self, tmp_path, monkeypatch) -> None:  # noqa: ANN001
+        monkeypatch.setattr(imported, "STORE_ROOTS", (("A", str(tmp_path / "gone")),))
+        assert imported.store_root() is None
+
+    def test_a_file_inside_a_store_names_the_tool_that_owns_it(
+        self, tmp_path, monkeypatch  # noqa: ANN001
+    ) -> None:
+        store = tmp_path / "lmstudio" / "models"
+        (store / "unsloth" / "Qwen3.5-4B-MTP-GGUF").mkdir(parents=True)
+        weights = store / "unsloth" / "Qwen3.5-4B-MTP-GGUF" / "q4.gguf"
+        weights.write_bytes(b"GGUF")
+        monkeypatch.setattr(imported, "STORE_ROOTS", (("LM Studio", str(store)),))
+
+        assert imported.in_store(weights) == "LM Studio"
+
+    def test_a_file_outside_every_store_names_none(self, tmp_path, monkeypatch) -> None:  # noqa: ANN001
+        store = tmp_path / "lmstudio"
+        store.mkdir()
+        monkeypatch.setattr(imported, "STORE_ROOTS", (("LM Studio", str(store)),))
+
+        assert imported.in_store(_weights(tmp_path)) is None
+
+    def test_a_sibling_directory_is_not_inside_the_store(
+        self, tmp_path, monkeypatch  # noqa: ANN001
+    ) -> None:
+        """`models` and `models-backup` share a prefix and nothing else. A string
+        comparison would call the second one managed."""
+        store = tmp_path / "models"
+        store.mkdir()
+        decoy = tmp_path / "models-backup"
+        decoy.mkdir()
+        (decoy / "q4.gguf").write_bytes(b"GGUF")
+        monkeypatch.setattr(imported, "STORE_ROOTS", (("LM Studio", str(store)),))
+
+        assert imported.in_store(decoy / "q4.gguf") is None
+
+    def test_the_shipped_stores_are_expanded_rather_than_taken_literally(self) -> None:
+        """They are written with `~`, which is not a directory."""
+        assert all(raw.startswith("~/") for _name, raw in imported.STORE_ROOTS)
+        assert [name for name, _ in imported.STORE_ROOTS][0] == "LM Studio"

@@ -31,6 +31,46 @@ from localasr.registry.manager import (
 IMPORTED_PREFIX = "local-"
 """Imported ids are prefixed so they can never collide with a catalog id."""
 
+STORE_ROOTS: tuple[tuple[str, str], ...] = (
+    ("LM Studio", "~/.lmstudio/models"),
+    ("Hugging Face", "~/.cache/huggingface/hub"),
+)
+"""Where other tools on this machine keep GGUF files, best-maintained first.
+
+This is not a search path and nothing is loaded from here. It answers two questions the
+import flow otherwise asks the user to answer by typing: where to open the file dialog,
+and whether linking is the safe choice for the file they picked. A store belongs to a
+tool that keeps its own weights; a file inside one is not going to be tidied away by
+accident, which is the only thing a copy protects against.
+
+LM Studio comes first because it is what manages the refinement weights here now. The
+Hugging Face cache stays listed below it: `huggingface_hub` populates it, LM Studio
+hard-links from it, and a machine can easily have the cache and not the application.
+"""
+
+
+def store_root() -> Path | None:
+    """The first model store that exists on this machine, or None."""
+    for _, raw in STORE_ROOTS:
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            return path
+    return None
+
+
+def in_store(path: Path) -> str | None:
+    """The name of the tool whose store holds `path`, if one does.
+
+    Answers "is this file managed by something else?" — the condition under which
+    linking beats copying — from the path itself rather than from the user.
+    """
+    resolved = Path(path).expanduser().resolve()
+    for name, raw in STORE_ROOTS:
+        root = Path(raw).expanduser()
+        if root.is_dir() and resolved.is_relative_to(root.resolve()):
+            return name
+    return None
+
 
 class ImportError_(RegistryError):
     """Raised when a file cannot be accepted as a model."""

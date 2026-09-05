@@ -74,8 +74,10 @@ class Settings:
     """
 
     refiner_url: str | None = None
-    """Base URL of an OpenAI-compatible chat server for refinement, e.g. Unsloth Studio
-    or llama-server on ``http://127.0.0.1:8888``.
+    """Base URL of an OpenAI-compatible chat server for refinement, e.g. LM Studio on
+    ``http://127.0.0.1:1234`` or llama-server on ``http://127.0.0.1:8888``.
+
+    Without the ``/v1``: the client appends it.
 
     Separate from `node_url` on purpose rather than routed through it. The two backends
     have different jobs and different homes: ASR belongs where the 8 GB of unified memory
@@ -89,11 +91,11 @@ class Settings:
 
     Leave `refiner_url` unset and this set, and the desktop owns the refinement server:
     it can be started before a session and released after, which is the point. Set
-    `refiner_url` instead to point at one somebody else runs — Unsloth Studio, a
+    `refiner_url` instead to point at one somebody else runs — LM Studio, a
     llama-server under systemd — and it becomes read-only from here.
     """
     refiner_model: str = "localasr-refiner"
-    """Model name sent to the refiner. Unsloth Studio and llama-server both echo it, and
+    """Model name sent to the refiner. LM Studio and llama-server both echo it, and
     it is what the journal records — so it should name the actual weights."""
 
     refine_instruction: str = ""
@@ -209,7 +211,7 @@ class AppContext:
 
         Owning it means spawning `localasr.refine.host` as a child — not loading a model
         in this process. `refiner_url` is what hands the job to somebody else: a systemd
-        unit, Unsloth Studio, another machine.
+        unit, LM Studio, another machine.
         """
         return not self.settings.refiner_url
 

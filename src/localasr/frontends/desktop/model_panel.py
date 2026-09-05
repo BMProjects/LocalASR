@@ -234,7 +234,8 @@ class ModelPanel(QFrame):
         if self._thread is not None:
             return
         model_file, _ = QFileDialog.getOpenFileName(
-            self, "选择模型文件（.gguf）", str(Path.home()), "GGUF 模型 (*.gguf)"
+            self, "选择模型文件（.gguf）", str(imported.store_root() or Path.home()),
+            "GGUF 模型 (*.gguf)"
         )
         if not model_file:
             return

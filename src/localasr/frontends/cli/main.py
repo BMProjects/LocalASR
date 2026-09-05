@@ -432,6 +432,16 @@ def models_import(
         typer.secho(f"未知的 --kind：{kind}（可选 asr / llm）", fg="red", err=True)
         raise typer.Exit(1) from exc
 
+    owner = imported.in_store(model_file)
+    if owner and not link:
+        # Copying out of a store nobody is going to delete duplicates several GB on the
+        # same disk for nothing. Said, not decided: --link is still the user's to pass.
+        typer.secho(
+            f"提示：这个文件在 {owner} 的模型库里，加 --link 可避免重复占用磁盘。",
+            fg="yellow",
+            err=True,
+        )
+
     request = imported.ImportRequest(
         model_path=model_file, mmproj_path=mmproj, name=name, kind=role, link=link
     )
