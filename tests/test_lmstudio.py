@@ -78,6 +78,18 @@ class FakeLMStudio:
         return httpx.Response(404, text="Not Found")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_cli(monkeypatch):  # noqa: ANN001, ANN201
+    """Nothing in this file may run the real `lms`.
+
+    It is installed on the development machine, `lms daemon up` blocks for sixty seconds
+    before failing, and a test that starts LM Studio is not a unit test.
+    """
+    from localasr.refine import lmstudio
+
+    monkeypatch.setattr(lmstudio, "find_cli", lambda: None)
+
+
 @pytest.fixture
 def lms(monkeypatch):  # noqa: ANN001, ANN201
     fake = FakeLMStudio()
@@ -89,6 +101,30 @@ def lms(monkeypatch):  # noqa: ANN001, ANN201
 
     monkeypatch.setattr(httpx.Client, "__init__", patched)
     return fake
+
+
+@pytest.fixture
+def cli(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
+    """A stand-in for `lms` that records what it was asked to do."""
+    from localasr.refine import lmstudio
+
+    calls: list[list[str]] = []
+    fake = tmp_path / "lms"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(lmstudio, "find_cli", lambda: fake)
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def run(command, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        calls.append(list(command[1:]))
+        return Result()
+
+    monkeypatch.setattr(lmstudio.subprocess, "run", run)
+    return calls
 
 
 class TestDetection:
@@ -349,3 +385,223 @@ def test_reasoning_is_turned_off_in_a_way_lm_studio_honours() -> None:
 
     assert sent["reasoning_effort"] == "none", "LM Studio honours this one"
     assert sent["chat_template_kwargs"] == {"enable_thinking": False}, "llama-server that one"
+
+
+def _down_until_lms_runs(monkeypatch, cli) -> None:  # noqa: ANN001
+    """A server that answers only once `lms daemon up` and `lms server start` have run.
+
+    The HTTP fake stays up throughout so the model listing still works; what is being
+    simulated is the front end being off, which is `answers()`.
+    """
+    from localasr.refine import lmstudio
+
+    monkeypatch.setattr(lmstudio, "startable_here", lambda _url: True)
+    monkeypatch.setattr(
+        lmstudio.LMStudioCompanion, "answers", lambda _self: len(cli) >= 2
+    )
+
+
+class TestStartingTheServer:
+    """`lms`, doing locally what `node_ssh` does remotely.
+
+    Without this a companion can only talk to a server somebody else started, which
+    makes "starts with the app" half true — and it is the half the user meets first,
+    because LM Studio's `autoStartOnLaunch` is off by default.
+    """
+
+    def test_a_silent_server_is_started_with_lm_studios_own_recipe(
+        self, lms, cli, monkeypatch  # noqa: ANN001
+    ) -> None:
+        """Verbatim from the systemd unit in LM Studio's Linux docs: `daemon up` as
+        ExecStartPre, `server start` as ExecStart."""
+        from localasr.refine import lmstudio
+
+        _down_until_lms_runs(monkeypatch, cli)
+        lmstudio.LMStudioCompanion(URL).start()
+
+        assert cli == [["daemon", "up"], ["server", "start"]]
+
+    def test_a_server_this_session_started_is_stopped_again(self, lms, cli, monkeypatch) -> None:  # noqa: ANN001
+        from localasr.refine import lmstudio
+
+        _down_until_lms_runs(monkeypatch, cli)
+        companion = lmstudio.LMStudioCompanion(URL)
+        companion.start()
+        cli.clear()
+        companion.stop()
+
+        assert cli == [["server", "stop"]], "the daemon stays up; only the server was ours"
+
+    def test_a_server_already_running_is_not_restarted(self, lms, cli) -> None:  # noqa: ANN001
+        LMStudioCompanion(URL).start()
+        assert cli == [], "it was already answering"
+
+    def test_a_server_we_did_not_start_is_left_running(self, lms, cli) -> None:  # noqa: ANN001
+        companion = LMStudioCompanion(URL)
+        companion.start()
+        companion.stop()
+        assert cli == []
+
+    def test_autostart_off_reports_how_to_start_it_by_hand(self, lms, cli) -> None:  # noqa: ANN001
+        lms.up = False
+        with pytest.raises(LMStudioError, match="lms server start"):
+            LMStudioCompanion(URL, autostart=False).start()
+        assert cli == []
+
+
+class TestWhoCanBeStarted:
+    """`startable_here` — three conditions, all necessary."""
+
+    def test_a_remote_url_is_not_ours_to_start(self, cli) -> None:  # noqa: ANN001
+        from localasr.refine.lmstudio import startable_here
+
+        assert not startable_here("http://192.168.2.206:1234"), "lms starts it here, not there"
+
+    def test_a_different_port_is_not_the_server_lms_would_start(self, cli, monkeypatch) -> None:  # noqa: ANN001
+        """A down llama-server on 8091 must not get a button that brings up LM Studio on
+        1234 and then reports success against a URL nothing is listening on."""
+        from localasr.refine import lmstudio
+
+        monkeypatch.setattr(lmstudio, "configured_port", lambda: 1234)
+        assert not lmstudio.startable_here("http://127.0.0.1:8091")
+        assert lmstudio.startable_here("http://127.0.0.1:1234")
+
+    def test_without_the_cli_there_is_nothing_to_start_it_with(self, monkeypatch) -> None:  # noqa: ANN001
+        from localasr.refine import lmstudio
+
+        monkeypatch.setattr(lmstudio, "configured_port", lambda: 1234)
+        assert not lmstudio.startable_here("http://127.0.0.1:1234"), "no lms on this machine"
+
+    def test_the_port_comes_from_lm_studios_own_config(self, tmp_path, monkeypatch) -> None:  # noqa: ANN001
+        from localasr.refine import lmstudio
+
+        config = tmp_path / "http-server-config.json"
+        config.write_text('{"port": 4321, "networkInterface": "127.0.0.1"}')
+        monkeypatch.setattr(lmstudio, "SERVER_CONFIG", str(config))
+
+        assert lmstudio.configured_port() == 4321
+
+    def test_a_missing_config_falls_back_to_the_documented_default(
+        self, tmp_path, monkeypatch  # noqa: ANN001
+    ) -> None:
+        from localasr.refine import lmstudio
+
+        monkeypatch.setattr(lmstudio, "SERVER_CONFIG", str(tmp_path / "absent.json"))
+        assert lmstudio.configured_port() == lmstudio.DEFAULT_PORT == 1234
+
+
+class TestSilenceIsNotANo:
+    """The bug that left the buttons grey with nothing able to turn them on.
+
+    `speaks_lmstudio` returned False for a server that was merely not started, the
+    application cached that as "not LM Studio", and the cache outlived the reason.
+    """
+
+    def test_an_answer_that_is_not_lm_studio_is_a_definite_no(self, monkeypatch) -> None:  # noqa: ANN001
+        from localasr.refine.lmstudio import probe
+
+        original = httpx.Client.__init__
+
+        def patched(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            kwargs["transport"] = httpx.MockTransport(lambda r: httpx.Response(404))
+            original(self, *args, **kwargs)
+
+        monkeypatch.setattr(httpx.Client, "__init__", patched)
+        assert probe(URL) is False
+
+    def test_no_answer_at_all_is_not_a_no(self, lms) -> None:  # noqa: ANN001
+        from localasr.refine.lmstudio import probe
+
+        lms.up = False
+        assert probe(URL) is None, "not started yet is exactly what the button is for"
+
+    def test_a_running_lm_studio_is_a_yes(self, lms) -> None:  # noqa: ANN001
+        from localasr.refine.lmstudio import probe
+
+        assert probe(URL) is True
+
+
+class TestTheApplicationWhenLMStudioIsNotRunning:
+    """The reported symptom: 不可达, and both buttons grey with no way back."""
+
+    def _context(self, **settings):  # noqa: ANN001, ANN003, ANN202
+        from localasr.context import AppContext, Settings
+
+        return AppContext(settings=Settings(refiner_url=URL, **settings))
+
+    def test_a_stopped_lm_studio_still_gets_its_buttons(self, lms, monkeypatch) -> None:  # noqa: ANN001
+        from localasr.refine import lmstudio
+
+        lms.up = False
+        monkeypatch.setattr(lmstudio, "startable_here", lambda _url: True)
+        context = self._context()
+
+        assert context.lmstudio() is not None
+        assert context.refiner_controllable, "it is stopped, not absent"
+        assert not context.refiner_loaded
+
+    def test_a_stopped_server_this_machine_cannot_start_stays_read_only(self, lms) -> None:  # noqa: ANN001
+        """No `lms`, or a URL on another machine. Nothing here can help, and a button
+        that cannot work is worse than one that is honestly grey."""
+        lms.up = False
+        assert self._context().lmstudio() is None
+
+    def test_silence_is_not_cached_the_way_a_refusal_is(self, lms, monkeypatch) -> None:  # noqa: ANN001
+        """The bug. LM Studio was down at launch, the answer was cached, and starting
+        LM Studio afterwards changed nothing until the application was restarted."""
+        from localasr.refine import lmstudio
+
+        monkeypatch.setattr(lmstudio, "startable_here", lambda _url: False)
+        lms.up = False
+        context = self._context()
+        assert context.lmstudio() is None
+
+        lms.up = True
+        assert context.lmstudio() is not None, "it came up; the panel must notice"
+
+    def test_a_server_that_is_not_lm_studio_is_asked_once(self, monkeypatch) -> None:  # noqa: ANN001
+        """The other half: a llama-server answers definitively, and re-probing it every
+        few seconds for an answer that cannot change is waste."""
+        asked = {"n": 0}
+        original = httpx.Client.__init__
+
+        def patched(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            def handler(request: httpx.Request) -> httpx.Response:
+                asked["n"] += 1
+                return httpx.Response(404)
+
+            kwargs["transport"] = httpx.MockTransport(handler)
+            original(self, *args, **kwargs)
+
+        monkeypatch.setattr(httpx.Client, "__init__", patched)
+        context = self._context()
+        for _ in range(5):
+            context.lmstudio()
+
+        assert asked["n"] == 1
+
+
+def test_a_failing_daemon_up_names_both_fixes(lms, cli, monkeypatch) -> None:  # noqa: ANN001
+    """Measured on this machine: `lms` is installed by the desktop app, but the headless
+    llmster is not, so `lms daemon up` wakes a GUI and times out after ~60 s. The two
+    ways out are installing llmster or opening the desktop app, and the error has to say
+    so — "timed out" on its own is a dead end.
+    """
+    from localasr.refine import lmstudio
+
+    monkeypatch.setattr(lmstudio, "startable_here", lambda _url: True)
+    monkeypatch.setattr(lmstudio.LMStudioCompanion, "answers", lambda _self: False)
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "Error: Timed out waiting for LM Studio daemon to start."
+
+    monkeypatch.setattr(lmstudio.subprocess, "run", lambda *a, **k: Failed())
+
+    with pytest.raises(lmstudio.LMStudioError) as caught:
+        lmstudio.LMStudioCompanion(URL).start()
+
+    message = str(caught.value)
+    assert "install.sh" in message and "桌面版" in message
+    assert "Timed out" in message, "the CLI's own words are the evidence"

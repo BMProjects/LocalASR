@@ -20,7 +20,8 @@ from localasr.apps.events import ModelChanged, ModelDownloaded
 from localasr.core.engine.manager import EngineManager
 from localasr.node.companion import NodeCompanion
 from localasr.refine import host
-from localasr.refine.lmstudio import LMStudioCompanion, speaks_lmstudio
+from localasr.refine import lmstudio as lmstudio_api
+from localasr.refine.lmstudio import LMStudioCompanion
 from localasr.refine.node_client import NodeRefiner
 from localasr.refine.types import (
     RefinementMode,
@@ -206,7 +207,7 @@ class AppContext:
     _refiner: host.Companion | None = field(default=None, init=False, repr=False)
     _node: NodeCompanion | None = field(default=None, init=False, repr=False)
     _lmstudio: LMStudioCompanion | None = field(default=None, init=False, repr=False)
-    _lmstudio_probed: bool = field(default=False, init=False, repr=False)
+    _lmstudio_ruled_out: bool = field(default=False, init=False, repr=False)
 
     @property
     def spec(self) -> ModelSpec:
@@ -255,32 +256,45 @@ class AppContext:
     @property
     def refiner_loaded(self) -> bool:
         if self._lmstudio is not None:
-            return bool(self._lmstudio.resident())
+            return self._lmstudio.answers() and bool(self._lmstudio.resident())
         return self._refiner is not None and self._refiner.running
 
     def lmstudio(self) -> LMStudioCompanion | None:
         """The companion for `refiner_url`, when that URL is an LM Studio server.
 
-        Probed once, off the UI thread — the panel's periodic refresh already runs there
-        and is the first thing to ask. A settings flag would have been one more thing for
-        the user to know, and `/api/v1/models` answers it without being told.
+        Probed off the UI thread — the panel's periodic refresh already runs there and
+        is the first thing to ask. A settings flag would have been one more thing for the
+        user to know, and `/api/v1/models` answers it without being told.
+
+        A silent URL is not a no. LM Studio's HTTP front end is off by default, so the
+        state the user meets first is "not started", and that is exactly the state the
+        start button exists for: when the URL is a loopback address on the port LM Studio
+        is configured to serve, and `lms` is installed, it is one.
         """
         url = self.settings.refiner_url
-        if not url:
+        if not url or self._lmstudio is not None or self._lmstudio_ruled_out:
+            return self._lmstudio
+        verdict = lmstudio_api.probe(url, self.settings.refiner_token)
+        if verdict is False:
+            # A definite no — something answered and it was not LM Studio. Only this is
+            # cached. Caching silence was the bug: a server that had not been started
+            # yet was written off as "not LM Studio" for the rest of the session, and
+            # the buttons that would have started it stayed grey with nothing left to
+            # turn them on.
+            self._lmstudio_ruled_out = True
             return None
-        if not self._lmstudio_probed:
-            self._lmstudio_probed = True
-            if speaks_lmstudio(url, self.settings.refiner_token):
-                self._lmstudio = LMStudioCompanion(
-                    url,
-                    token=self.settings.refiner_token,
-                    model=(
-                        self.settings.refiner_model
-                        if self.settings.refiner_model != DEFAULT_REFINER_MODEL
-                        else None
-                    ),
-                    release_on_exit=self.settings.refiner_release_on_exit,
-                )
+        if verdict is None and not lmstudio_api.startable_here(url):
+            return None
+        self._lmstudio = LMStudioCompanion(
+            url,
+            token=self.settings.refiner_token,
+            model=(
+                self.settings.refiner_model
+                if self.settings.refiner_model != DEFAULT_REFINER_MODEL
+                else None
+            ),
+            release_on_exit=self.settings.refiner_release_on_exit,
+        )
         return self._lmstudio
 
     @property

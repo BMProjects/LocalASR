@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from localasr.context import AppContext
 from localasr.frontends.desktop.theme import set_tone
-from localasr.refine.lmstudio import LMStudioCompanion
+from localasr.refine.lmstudio import LMStudioCompanion, startable_here
 from localasr.registry import imported
 from localasr.registry.manager import ModelKind
 
@@ -113,8 +113,15 @@ def _probe_lmstudio(companion: LMStudioCompanion) -> BackendStatus:
     """LM Studio answers "what is loaded", so say that rather than only "reachable"."""
     try:
         resident = companion.resident()
-    except (httpx.HTTPError, ValueError) as exc:
-        return BackendStatus("不可达", f"{companion.url}（{type(exc).__name__}）", "danger")
+    except (httpx.HTTPError, ValueError):
+        # Not a fault. LM Studio's HTTP front end is off unless `autoStartOnLaunch` is
+        # on, so "not started" is the normal state before a session — and one this
+        # machine can leave, which is what the button is for.
+        if companion.autostart and startable_here(companion.url):
+            return BackendStatus("未启动", f"{companion.url} · 点「启动」由 lms 拉起", "neutral")
+        return BackendStatus(
+            "不可达", f"{companion.url} · 请启动 LM Studio 的本地服务器", "danger"
+        )
     if resident:
         return BackendStatus("就绪", f"LM Studio · {'、'.join(resident)} 已加载", "success")
     # Not a fault: LM Studio loads on demand, so an empty server still refines — the

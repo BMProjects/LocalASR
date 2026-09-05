@@ -28,16 +28,37 @@ Docs: https://lmstudio.ai/docs/api/rest-api (load, unload, list). Default port 1
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
 DEFAULT_URL = "http://127.0.0.1:1234"
 """LM Studio's server port, and loopback unless the user changes `networkInterface`."""
 
+DEFAULT_PORT = 1234
+SERVER_CONFIG = "~/.lmstudio/.internal/http-server-config.json"
+"""Where LM Studio records the port it serves on. Read rather than assumed, because a
+user who moved it would otherwise get a start button that starts the wrong thing."""
+
+CLI = "~/.lmstudio/bin/lms"
+"""Where the installer puts `lms`. `PATH` is tried first — this is the fallback for a
+desktop launcher, which does not inherit a login shell's exports."""
+
 PROBE_TIMEOUT = 3.0
 LOAD_TIMEOUT = 300.0
 """A cold load reads several gigabytes off disk before it answers."""
+
+SERVICE_TIMEOUT = 120.0
+"""`lms daemon up` waits ~60 s on its own before giving up."""
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1", "")
 
 
 class LMStudioError(RuntimeError):
@@ -48,20 +69,66 @@ def _headers(token: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def speaks_lmstudio(url: str, token: str | None = None) -> bool:
-    """Whether `url` is an LM Studio server rather than some other OpenAI-compatible one.
+def find_cli() -> Path | None:
+    """`lms`, LM Studio's own CLI, if this machine has it."""
+    found = shutil.which("lms")
+    if found:
+        return Path(found)
+    fallback = Path(CLI).expanduser()
+    return fallback if os.access(fallback, os.X_OK) else None
 
-    Asked rather than configured. Every server this application can talk to serves
-    `/v1/chat/completions`; only LM Studio also serves `/api/v1/models` returning a
-    `models` list. llama-server answers 404 there, which is an unambiguous no, and one
-    fewer setting for the user to know about and get wrong.
+
+def configured_port() -> int:
+    """The port LM Studio serves on, from its own config file."""
+    try:
+        raw = json.loads(Path(SERVER_CONFIG).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return DEFAULT_PORT
+    port = raw.get("port")
+    return port if isinstance(port, int) else DEFAULT_PORT
+
+
+def probe(url: str, token: str | None = None) -> bool | None:
+    """Whether `url` is LM Studio. `None` means it did not answer, which is not a no.
+
+    Every server this application can talk to serves `/v1/chat/completions`; only LM
+    Studio also serves `/api/v1/models` returning a `models` list. llama-server answers
+    404 there — an unambiguous no, and one fewer setting for the user to get wrong.
+
+    The third case is the one that matters here. A server that is simply not started yet
+    is exactly what the start button exists for, and reading its silence as "not LM
+    Studio" is what left those buttons grey with nothing able to turn them on again.
     """
     try:
         with httpx.Client(timeout=PROBE_TIMEOUT) as client:
             response = client.get(f"{url.rstrip('/')}/api/v1/models", headers=_headers(token))
+    except httpx.HTTPError:
+        return None
+    try:
         return response.status_code == 200 and isinstance(response.json().get("models"), list)
-    except (httpx.HTTPError, ValueError):
+    except ValueError:
         return False
+
+
+def speaks_lmstudio(url: str, token: str | None = None) -> bool:
+    """A running LM Studio at `url`. Silence counts as no."""
+    return probe(url, token) is True
+
+
+def startable_here(url: str) -> bool:
+    """Whether a silent `url` is an LM Studio this machine can start.
+
+    Three conditions, all necessary. The host must be loopback, because `lms` starts the
+    server on this machine and nowhere else. The port must be the one LM Studio is
+    configured to serve on, or `lms server start` would bring up something the URL does
+    not point at. And `lms` must exist.
+    """
+    parsed = urlparse(url if "//" in url else f"//{url}")
+    if parsed.hostname not in LOOPBACK:
+        return False
+    if (parsed.port or DEFAULT_PORT) != configured_port():
+        return False
+    return find_cli() is not None
 
 
 @dataclass
@@ -75,6 +142,15 @@ class LMStudioCompanion:
     LM Studio has is not a guess; several are ambiguous and say so."""
 
     context_length: int | None = None
+    autostart: bool = True
+    """Bring the server up with `lms` when it is not answering.
+
+    The recognition node has the same option under `node_ssh`, for the same reason and
+    at the same cost: without it a companion can only talk to a service somebody else
+    started, and "starts with the app" is half true. `lms` is the local equivalent of
+    that ssh call — LM Studio's own CLI, doing what its documented systemd unit does.
+    """
+
     release_on_exit: bool = True
     """Unload on exit even if this session did not load it.
 
@@ -89,6 +165,9 @@ class LMStudioCompanion:
     _loaded: bool = field(default=False, init=False, repr=False)
     """Whether *we* made it resident — the only thing unloaded when `release_on_exit`
     is off."""
+
+    _started_server: bool = field(default=False, init=False, repr=False)
+    """Whether *we* started the server. Only then is it ours to stop."""
 
     def __post_init__(self) -> None:
         self.url = self.url.rstrip("/")
@@ -142,10 +221,12 @@ class LMStudioCompanion:
         Returns what happened, in words the status panel can show.
         """
         if not self.answers():
-            raise LMStudioError(
-                f"LM Studio 服务 {self.url} 无响应。请在 LM Studio 里启动本地服务器"
-                "（Developer → Start Server，或 `lms server start`）。"
-            )
+            if not (self.autostart and startable_here(self.url)):
+                raise LMStudioError(
+                    f"LM Studio 服务 {self.url} 无响应。请在 LM Studio 里启动本地服务器"
+                    "（Developer → Start Server，或 `lms server start`）。"
+                )
+            self._start_server()
         key = self.key()
         if key in self.resident():
             # Found it warm. Adopted, not loaded: whether it is ours to unload afterwards
@@ -176,19 +257,68 @@ class LMStudioCompanion:
         """Unload, so the card is not still holding a refiner after the window closes."""
         instance, loaded = self._instance, self._loaded
         self._instance, self._loaded = None, False
-        if instance is None or not (self.release_on_exit or loaded):
-            return
+        if instance is not None and (self.release_on_exit or loaded):
+            try:
+                with httpx.Client(timeout=LOAD_TIMEOUT) as client:
+                    client.post(
+                        f"{self.url}/api/v1/models/unload",
+                        json={"instance_id": instance},
+                        headers=_headers(self.token),
+                    )
+            except httpx.HTTPError:
+                # Unreachable at exit means its memory is its own problem now. Raising
+                # here would only stop the application from closing.
+                pass
+        if self._started_server:
+            self._started_server = False
+            # `lms server stop`, not `lms daemon down`: the server is what this session
+            # turned on, and the daemon may be holding somebody else's work.
+            self._run_cli("server", "stop", check=False)
+
+    def _start_server(self) -> None:
+        """`lms daemon up` then `lms server start`, which is LM Studio's own recipe.
+
+        Verbatim from the unit in its Linux startup docs — `daemon up` as ExecStartPre,
+        `server start` as ExecStart. The daemon is the process that holds models; the
+        server is the HTTP front end this application speaks to, and it is off by default
+        (`autoStartOnLaunch: false`), so both steps are needed from cold.
+        """
         try:
-            with httpx.Client(timeout=LOAD_TIMEOUT) as client:
-                client.post(
-                    f"{self.url}/api/v1/models/unload",
-                    json={"instance_id": instance},
-                    headers=_headers(self.token),
-                )
-        except httpx.HTTPError:
-            # Unreachable at exit means its memory is its own problem now. Raising here
-            # would only stop the application from closing.
-            pass
+            self._run_cli("daemon", "up")
+        except LMStudioError as exc:
+            # `lms daemon up` wakes whatever `app-install-location.json` points at. On a
+            # machine with only the desktop app and its CLI — no headless llmster — that
+            # is a GUI application, and it times out after ~60 s with nothing started.
+            # Observed exactly that here, so say which of the two fixes applies.
+            raise LMStudioError(
+                f"{exc}\n无法从命令行启动 LM Studio 服务。两个办法："
+                "装上无界面守护进程 `curl -fsSL https://lmstudio.ai/install.sh | bash`，"
+                "或者手动打开 LM Studio 桌面版（它的 autoStartOnLaunch 会带起服务器）。"
+            ) from exc
+        self._run_cli("server", "start")
+        self._started_server = True
+        end = time.monotonic() + SERVICE_TIMEOUT
+        while time.monotonic() < end:
+            if self.answers():
+                return
+            time.sleep(1.0)
+        raise LMStudioError(f"lms 已执行，但 {self.url} 在 {SERVICE_TIMEOUT:.0f}s 内没有就绪")
+
+    def _run_cli(self, *args: str, check: bool = True) -> None:
+        cli = find_cli()
+        if cli is None:
+            raise LMStudioError("找不到 lms（LM Studio 的命令行工具）")
+        try:
+            result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                [str(cli), *args], capture_output=True, text=True, timeout=SERVICE_TIMEOUT
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            if not check:
+                return
+            raise LMStudioError(f"lms {' '.join(args)} 无法执行：{exc}") from exc
+        if check and result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[:200]
+            raise LMStudioError(f"lms {' '.join(args)} 失败：{detail}")
 
 
 def _reason(response: httpx.Response) -> str:

@@ -252,9 +252,33 @@ probe cannot decide:
 - `refiner_release_on_exit = false` for an LM Studio whose own chat window is in use —
   otherwise closing this window takes its model with it.
 
-JIT loading means the buttons are about latency, not correctness: refinement works either
-way, but nothing except this application will unload the model afterwards, and a 4B Q4
-holds ~2.9 GB of a 4 GB card until something does.
+JIT loading means the model buttons are about latency, not correctness: refinement works
+either way, but nothing except this application will unload the model afterwards, and a
+4B Q4 holds ~2.9 GB of a 4 GB card until something does.
+
+The HTTP front end is a different matter — it is off unless `autoStartOnLaunch` is set,
+so "not started" is the state most sessions begin in. When the URL is loopback, on the
+port LM Studio's own config names, and `lms` is on this machine, 「启动」 runs LM Studio's
+documented recipe before loading anything:
+
+    lms daemon up        # ExecStartPre, in their systemd unit
+    lms server start     # ExecStart
+
+and 「卸载」 stops the server again if this session started it (`lms server stop` — never
+`lms daemon down`, which would take somebody else's models with it).
+
+**That needs the headless daemon, not just the CLI.** The desktop app installs `lms` but
+not llmster, and `lms daemon up` then wakes a GUI application and times out after ~60 s —
+measured here. Either install the daemon,
+
+    curl -fsSL https://lmstudio.ai/install.sh | bash
+
+or open the LM Studio desktop app and let its `autoStartOnLaunch` bring the server up.
+The error says both; a bare "timed out" would be a dead end.
+
+A URL that does not answer is not evidence that it is not LM Studio, and treating it as
+such is what once left both buttons grey for the rest of a session with nothing able to
+re-enable them. Only a server that answers *and is something else* is ruled out.
 
 ## `--no-dev` belongs on every uv command
 
