@@ -115,12 +115,24 @@ def cli(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
     monkeypatch.setattr(lmstudio, "find_cli", lambda: fake)
 
     class Result:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+        def __init__(self, stdout: str = "") -> None:
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    state = {"daemon": False}
 
     def run(command, **kwargs):  # noqa: ANN001, ANN003, ANN202
-        calls.append(list(command[1:]))
+        args = list(command[1:])
+        calls.append(args)
+        if args[:2] == ["daemon", "status"]:
+            # `lms daemon status --json`, which exits 0 whatever the answer.
+            status = "running" if state["daemon"] else "not-running"
+            return Result(f'{{"status": "{status}"}}')
+        if args == ["daemon", "up"]:
+            state["daemon"] = True
+        elif args == ["daemon", "down"]:
+            state["daemon"] = False
         return Result()
 
     monkeypatch.setattr(lmstudio.subprocess, "run", run)
@@ -391,13 +403,15 @@ def _down_until_lms_runs(monkeypatch, cli) -> None:  # noqa: ANN001
     """A server that answers only once `lms daemon up` and `lms server start` have run.
 
     The HTTP fake stays up throughout so the model listing still works; what is being
-    simulated is the front end being off, which is `answers()`.
+    simulated is the front end being off, which is `answers()`. Keyed on `server start`
+    rather than on a call count, so it is also true for a daemon that was already up —
+    otherwise that path waits out the full service timeout for a server it did start.
     """
     from localasr.refine import lmstudio
 
     monkeypatch.setattr(lmstudio, "startable_here", lambda _url: True)
     monkeypatch.setattr(
-        lmstudio.LMStudioCompanion, "answers", lambda _self: len(cli) >= 2
+        lmstudio.LMStudioCompanion, "answers", lambda _self: ["server", "start"] in cli
     )
 
 
@@ -419,7 +433,11 @@ class TestStartingTheServer:
         _down_until_lms_runs(monkeypatch, cli)
         lmstudio.LMStudioCompanion(URL).start()
 
-        assert cli == [["daemon", "up"], ["server", "start"]]
+        assert cli == [
+            ["daemon", "status", "--json"],
+            ["daemon", "up"],
+            ["server", "start"],
+        ]
 
     def test_a_server_this_session_started_is_stopped_again(self, lms, cli, monkeypatch) -> None:  # noqa: ANN001
         from localasr.refine import lmstudio
@@ -430,7 +448,7 @@ class TestStartingTheServer:
         cli.clear()
         companion.stop()
 
-        assert cli == [["server", "stop"]], "the daemon stays up; only the server was ours"
+        assert cli == [["server", "stop"], ["daemon", "down"]], "both were ours to end"
 
     def test_a_server_already_running_is_not_restarted(self, lms, cli) -> None:  # noqa: ANN001
         LMStudioCompanion(URL).start()
@@ -605,3 +623,54 @@ def test_a_failing_daemon_up_names_both_fixes(lms, cli, monkeypatch) -> None:  #
     message = str(caught.value)
     assert "install.sh" in message and "桌面版" in message
     assert "Timed out" in message, "the CLI's own words are the evidence"
+
+
+class TestTheDaemonItself:
+    """llmster, one layer below the HTTP server.
+
+    Shutting one down ends every client's session, not just this one — so the rule that
+    governs the model and the server governs it too, and more strictly: only a daemon
+    this session started is this session's to stop.
+    """
+
+    def _companion(self, monkeypatch, cli):  # noqa: ANN001, ANN202
+        from localasr.refine import lmstudio
+
+        _down_until_lms_runs(monkeypatch, cli)
+        return lmstudio.LMStudioCompanion(URL)
+
+    def test_a_daemon_this_session_started_is_shut_down_again(self, lms, cli, monkeypatch) -> None:  # noqa: ANN001
+        companion = self._companion(monkeypatch, cli)
+        companion.start()
+        cli.clear()
+        companion.stop()
+
+        assert cli == [["server", "stop"], ["daemon", "down"]]
+
+    def test_a_daemon_already_running_is_left_alone(self, lms, cli, monkeypatch) -> None:  # noqa: ANN001
+        """Somebody else's llmster, possibly with somebody else's model in it."""
+        from localasr.refine import lmstudio
+
+        monkeypatch.setattr(lmstudio, "daemon_running", lambda: True)
+        companion = self._companion(monkeypatch, cli)
+        companion.start()
+        assert ["daemon", "up"] not in cli, "it was already up"
+
+        cli.clear()
+        companion.stop()
+        assert cli == [["server", "stop"]], "the daemon was not ours to end"
+
+    def test_the_status_is_read_from_the_body_not_the_exit_code(self, cli) -> None:  # noqa: ANN001
+        """`lms daemon status --json` exits 0 whether or not llmster is running, so the
+        exit code says nothing. Reading it instead would report every daemon as up."""
+        from localasr.refine.lmstudio import daemon_running
+
+        assert daemon_running() is False
+        assert cli == [["daemon", "status", "--json"]]
+
+    def test_without_lms_the_question_has_no_answer(self) -> None:
+        """`None`, not False — and the difference matters, because False would mean
+        "not running" and invite a start that has nothing to start it with."""
+        from localasr.refine.lmstudio import daemon_running
+
+        assert daemon_running() is None

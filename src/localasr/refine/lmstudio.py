@@ -88,6 +88,27 @@ def configured_port() -> int:
     return port if isinstance(port, int) else DEFAULT_PORT
 
 
+def daemon_running() -> bool | None:
+    """Whether llmster is already up. `None` when `lms` cannot answer.
+
+    `lms daemon status --json` prints `{"status": "running"|"not-running"}` and exits 0
+    either way, so the exit code says nothing and the body says everything.
+    """
+    cli = find_cli()
+    if cli is None:
+        return None
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [str(cli), "daemon", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT * 4,
+        )
+        return json.loads(result.stdout).get("status") == "running"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def probe(url: str, token: str | None = None) -> bool | None:
     """Whether `url` is LM Studio. `None` means it did not answer, which is not a no.
 
@@ -168,6 +189,10 @@ class LMStudioCompanion:
 
     _started_server: bool = field(default=False, init=False, repr=False)
     """Whether *we* started the server. Only then is it ours to stop."""
+
+    _started_daemon: bool = field(default=False, init=False, repr=False)
+    """Whether *we* started llmster itself. Same rule one layer down, and it matters
+    more here: `lms daemon down` ends every client's session, not just ours."""
 
     def __post_init__(self) -> None:
         self.url = self.url.rstrip("/")
@@ -271,9 +296,14 @@ class LMStudioCompanion:
                 pass
         if self._started_server:
             self._started_server = False
-            # `lms server stop`, not `lms daemon down`: the server is what this session
-            # turned on, and the daemon may be holding somebody else's work.
             self._run_cli("server", "stop", check=False)
+        if self._started_daemon:
+            # Only a daemon this session started. `lms daemon down` ends every client's
+            # session, not just this one, so adopting one and then shutting it down would
+            # take somebody else's loaded model with it — the same mistake the node
+            # companion is written to avoid, one layer further down.
+            self._started_daemon = False
+            self._run_cli("daemon", "down", check=False)
 
     def _start_server(self) -> None:
         """`lms daemon up` then `lms server start`, which is LM Studio's own recipe.
@@ -283,6 +313,10 @@ class LMStudioCompanion:
         server is the HTTP front end this application speaks to, and it is off by default
         (`autoStartOnLaunch: false`), so both steps are needed from cold.
         """
+        if daemon_running():
+            # Already up — somebody else's, so not ours to shut down afterwards.
+            self._start_http_server()
+            return
         try:
             self._run_cli("daemon", "up")
         except LMStudioError as exc:
@@ -295,6 +329,17 @@ class LMStudioCompanion:
                 "装上无界面守护进程 `curl -fsSL https://lmstudio.ai/install.sh | bash`，"
                 "或者手动打开 LM Studio 桌面版（它的 autoStartOnLaunch 会带起服务器）。"
             ) from exc
+        self._started_daemon = True
+        self._start_http_server()
+
+    def _start_http_server(self) -> None:
+        """The HTTP front end, and the wait for it to answer.
+
+        Separate from the daemon because the two have different owners: llmster may
+        already be somebody else's, while the front end is cheap to start and stop.
+        `lms server start` is a no-op when `autoStartOnLaunch` already brought it up with
+        the daemon, which is the common case and costs nothing.
+        """
         self._run_cli("server", "start")
         self._started_server = True
         end = time.monotonic() + SERVICE_TIMEOUT

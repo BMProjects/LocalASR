@@ -234,6 +234,13 @@ say so rather than doing nothing.
 the first request. `autoStartOnLaunch` is off, so the server still has to be started once
 per run — `lms server start`, or Developer → Start Server.
 
+llmster is a service, not a window. It is its own 151 MB binary under
+`~/.lmstudio/llmster/`, links no X11, Wayland or GTK library, opens no display file
+descriptor, and starts with `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_SESSION_TYPE` and
+`XDG_RUNTIME_DIR` all unset. It holds the listening socket itself (`llmster` is the
+process `ss` names on 127.0.0.1:1234). Idle cost: ~450 MiB RSS and 14 MiB of VRAM once
+the model is unloaded.
+
 LM Studio is the one external refiner the 「启动」/「卸载」 buttons still work for, because
 it exposes residency as part of its API rather than as an implementation detail:
 
@@ -264,8 +271,19 @@ documented recipe before loading anything:
     lms daemon up        # ExecStartPre, in their systemd unit
     lms server start     # ExecStart
 
-and 「卸载」 stops the server again if this session started it (`lms server stop` — never
-`lms daemon down`, which would take somebody else's models with it).
+and 「卸载」 winds back exactly what it started, in reverse: unload the model, `lms server
+stop`, `lms daemon down`. Each step is conditional on this session having caused it. A
+daemon that was already up is somebody else's — possibly with somebody else's model in
+it — and `lms daemon down` ends every client's session, not just this one, so it is asked
+first (`lms daemon status --json`, whose exit code is 0 either way and whose body carries
+the answer).
+
+Cold to cold, measured, nothing else running:
+
+    start_refiner()   5.8 s   daemon up + server start + model load (3.1 s)
+    refine            2.4 s   到出 -> 导出
+    shutdown          0.8 s   unload + server stop + daemon down
+    afterwards                {"status":"not-running"}, 14 MiB VRAM
 
 **That needs the headless daemon, not just the CLI.** The desktop app installs `lms`, but
 `lms daemon up` then wakes the GUI application, which does not accept `--run-as-service`
@@ -280,7 +298,9 @@ not always include, and the installer stops with a clear message if it is missin
 Measured afterwards, no GUI anywhere:
 
     lms daemon up                    2.3 s      llmster v0.0.23+1
-    lms server start                 ~1 s       port 1234
+    lms daemon down                  0.2 s
+    lms server start                 ~1 s       port 1234 (a no-op when
+                                                autoStartOnLaunch already did it)
     model load, cold                 3.4 s      qwen3.5-4b-mtp
     refinement, warm                 2.4 s      到出 -> 导出
     unload on exit                   0.5 s      3734 MiB -> 14 MiB
