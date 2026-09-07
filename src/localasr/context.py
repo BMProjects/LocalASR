@@ -303,6 +303,11 @@ class AppContext:
 
         Two different mechanisms, one question. Spawning a child is not the only way to
         own a model's lifetime; a server that exposes load and unload hands it over too.
+
+        Reads the last probe rather than making one: this is called from the UI thread on
+        every panel refresh, and an HTTP round trip there would show as a stalled window.
+        `lmstudio()` is what probes, and both of its callers — the desktop's startup
+        thread and the panel's refresh thread — are threads for that reason.
         """
         return self.refiner_managed or self._lmstudio is not None
 

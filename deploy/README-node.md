@@ -267,14 +267,27 @@ documented recipe before loading anything:
 and 「卸载」 stops the server again if this session started it (`lms server stop` — never
 `lms daemon down`, which would take somebody else's models with it).
 
-**That needs the headless daemon, not just the CLI.** The desktop app installs `lms` but
-not llmster, and `lms daemon up` then wakes a GUI application and times out after ~60 s —
-measured here. Either install the daemon,
+**That needs the headless daemon, not just the CLI.** The desktop app installs `lms`, but
+`lms daemon up` then wakes the GUI application, which does not accept `--run-as-service`
+and times out after ~60 s. Install llmster and the same command starts a headless service
+instead:
 
     curl -fsSL https://lmstudio.ai/install.sh | bash
 
-or open the LM Studio desktop app and let its `autoStartOnLaunch` bring the server up.
-The error says both; a bare "timed out" would be a dead end.
+(`ldconfig` must be on `PATH` — on Debian it lives in `/usr/sbin`, which a user shell does
+not always include, and the installer stops with a clear message if it is missing.)
+
+Measured afterwards, no GUI anywhere:
+
+    lms daemon up                    2.3 s      llmster v0.0.23+1
+    lms server start                 ~1 s       port 1234
+    model load, cold                 3.4 s      qwen3.5-4b-mtp
+    refinement, warm                 2.4 s      到出 -> 导出
+    unload on exit                   0.5 s      3734 MiB -> 14 MiB
+
+If llmster is absent the error says so and names both fixes — installing it, or opening
+the desktop app and letting its `autoStartOnLaunch` bring the server up. A bare
+"timed out" would be a dead end.
 
 A URL that does not answer is not evidence that it is not LM Studio, and treating it as
 such is what once left both buttons grey for the rest of a session with nothing able to
