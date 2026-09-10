@@ -30,13 +30,19 @@ class Delivery:
     detail: str | None = None
 
 
-def _run(cmd: list[str], text: str | None = None, timeout: float = 10.0) -> bool:
+def _run(
+    cmd: list[str],
+    text: str | None = None,
+    timeout: float = 10.0,
+    env: dict[str, str] | None = None,
+) -> bool:
     try:
         proc = subprocess.run(
             cmd,
             input=text.encode() if text is not None else None,
             capture_output=True,
             timeout=timeout,
+            env={**os.environ, **env} if env else None,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -45,6 +51,26 @@ def _run(cmd: list[str], text: str | None = None, timeout: float = 10.0) -> bool
 
 def _session_is_wayland() -> bool:
     return os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+
+
+def ydotool_socket() -> str:
+    """The socket path ydotool will actually use.
+
+    This mirrors the client binary's own order: YDOTOOL_SOCKET, then
+    $XDG_RUNTIME_DIR/.ydotool_socket, then /tmp/.ydotool_socket. Resolving it
+    differently here is worse than not checking at all — ydotool_ready() would
+    approve a path the command never opens, deliver() would pick ydotool, the
+    call would fail, and the text would land on the clipboard with no
+    explanation. That happens whenever XDG_RUNTIME_DIR is absent: a systemd
+    system unit, cron, a tty, an ssh login.
+    """
+    explicit = os.environ.get("YDOTOOL_SOCKET")
+    if explicit:
+        return explicit
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return f"{runtime}/.ydotool_socket"
+    return "/tmp/.ydotool_socket"
 
 
 def ydotool_ready() -> tuple[bool, str | None]:
@@ -60,7 +86,7 @@ def ydotool_ready() -> tuple[bool, str | None]:
         return False, "not installed"
     if not os.access("/dev/uinput", os.W_OK):
         return False, "/dev/uinput is not writable by this user"
-    socket = os.environ.get("YDOTOOL_SOCKET") or f"/run/user/{os.getuid()}/.ydotool_socket"
+    socket = ydotool_socket()
     if not os.path.exists(socket):
         return False, f"ydotoold is not running (no socket at {socket})"
     return True, None
@@ -93,7 +119,9 @@ def copy_to_clipboard(text: str) -> bool:
 
 def _type_with_ydotool(text: str) -> bool:
     # `--` stops ydotool parsing text that begins with a dash as options.
-    return _run(["ydotool", "type", "--", text])
+    # Passing the socket explicitly keeps the command on the path ydotool_ready()
+    # approved, whatever the child process would have resolved on its own.
+    return _run(["ydotool", "type", "--", text], env={"YDOTOOL_SOCKET": ydotool_socket()})
 
 
 def _type_with_wtype(text: str) -> bool:

@@ -140,6 +140,49 @@ def test_missing_pactl_reports_no_monitor(monkeypatch):
     assert pulse.list_monitors() == []
 
 
+def test_an_unreachable_server_is_not_reported_as_a_sink_without_a_monitor(monkeypatch):
+    """Two causes, one None, and the wrong one was being named.
+
+    `default_monitor()` returns None both when pactl cannot reach the audio server and
+    when it reaches it and the default sink has no monitor. Doctor reported the second
+    either way, which sends the user looking at their audio routing for a problem that
+    is in the environment the process was started in — no XDG_RUNTIME_DIR, so no path to
+    the server's socket at all. Observed under `env -u XDG_RUNTIME_DIR`.
+    """
+    from localasr.frontends.cli import doctor
+
+    def unreachable(*_args, **_kwargs):
+        raise pulse.PulseError("pactl info: Connection failure: Connection refused")
+
+    monkeypatch.setattr(pulse, "_pactl", unreachable)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    detail = _system_audio_detail(doctor)
+    assert "Connection refused" in detail, "the server's own words are the finding"
+    assert "no monitor for the default sink" not in detail
+    assert "XDG_RUNTIME_DIR" in detail, "and the remedy that actually applies"
+
+
+def test_a_reachable_server_with_no_monitor_still_says_so(monkeypatch):
+    """The other branch has to survive: this one really is about audio routing, and
+    the meeting can still be recorded from the microphone."""
+    from localasr.frontends.cli import doctor
+
+    _fake_pactl(monkeypatch, default_sink="some-sink-without-a-monitor")
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    detail = _system_audio_detail(doctor)
+    assert "no monitor for the default sink" in detail
+    assert "XDG_RUNTIME_DIR" not in detail
+
+
+def _system_audio_detail(doctor) -> str:
+    check = next(c for c in doctor._capture_checks() if c.name.startswith("system audio"))
+    assert not check.ok
+    return check.detail
+
+
 def test_parec_is_asked_for_the_pipeline_format(monkeypatch):
     """parec converts for us; asking for anything else would mean resampling here."""
     _fake_pactl(monkeypatch)
@@ -254,6 +297,45 @@ def test_a_missing_daemon_is_reported_as_a_user_service(monkeypatch, tmp_path):
 
     remedy = dict((name, detail) for name, _ok, detail in text_output.diagnose())
     assert "systemctl --user enable --now ydotool.service" in remedy["ydotool (type at cursor)"]
+
+
+def test_socket_resolution_matches_what_ydotool_itself_would_do(monkeypatch, tmp_path):
+    """ydotool falls back to /tmp when XDG_RUNTIME_DIR is gone; the check must too.
+
+    A hardcoded /run/user/<uid> path made ydotool_ready() approve a socket the
+    command would never open, so dictation failed into the clipboard whenever the
+    process had no XDG_RUNTIME_DIR (systemd system unit, cron, tty, ssh).
+    """
+    from localasr.platform import text_output
+
+    monkeypatch.delenv("YDOTOOL_SOCKET", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    assert text_output.ydotool_socket() == "/tmp/.ydotool_socket"
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    assert text_output.ydotool_socket() == f"{tmp_path}/.ydotool_socket"
+
+    monkeypatch.setenv("YDOTOOL_SOCKET", "/explicit.sock")
+    assert text_output.ydotool_socket() == "/explicit.sock"
+
+
+def test_typing_is_pinned_to_the_socket_the_check_approved(monkeypatch, tmp_path):
+    """The child must not re-resolve the socket and reach a different one."""
+    from localasr.platform import text_output
+
+    monkeypatch.delenv("YDOTOOL_SOCKET", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / ".ydotool_socket").touch()
+
+    seen: dict[str, str] = {}
+
+    def fake_run(cmd, text=None, timeout=10.0, env=None):
+        seen.update(env or {})
+        return True
+
+    monkeypatch.setattr(text_output, "_run", fake_run)
+    assert text_output._type_with_ydotool("hi")
+    assert seen["YDOTOOL_SOCKET"] == text_output.ydotool_socket()
 
 
 def test_missing_clipboard_is_reported_because_it_is_the_last_resort(monkeypatch):

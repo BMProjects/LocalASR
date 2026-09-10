@@ -120,6 +120,17 @@ def _capture_checks() -> list[Check]:
         detail = monitor
     elif not pulse.available():
         detail = "parec not found — sudo apt install pulseaudio-utils"
+    elif (unreachable := pulse.server_error()) is not None:
+        # Not the same finding as "this sink has no monitor", and the remedy is
+        # nothing alike. Saying the wrong one sends the user looking at their audio
+        # routing for a problem that is in the environment the process was started in.
+        detail = unreachable
+        if not os.environ.get("XDG_RUNTIME_DIR"):
+            detail += (
+                "\n      XDG_RUNTIME_DIR is unset, so pactl cannot find the server's"
+                "\n      socket. Start from a desktop session, or export"
+                "\n      XDG_RUNTIME_DIR=/run/user/$(id -u)"
+            )
     else:
         detail = "no monitor for the default sink; meeting will record microphone only"
     checks.append(Check("system audio (parec monitor)", bool(monitor), detail, ("meeting",)))

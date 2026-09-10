@@ -45,6 +45,22 @@ def available() -> bool:
     return shutil.which("parec") is not None and shutil.which("pactl") is not None
 
 
+def server_error() -> str | None:
+    """Why the audio server cannot be reached, or None when it can.
+
+    `default_monitor()` returns None for two unrelated reasons — the server refused the
+    connection, or it answered and the default sink genuinely has no monitor — and a
+    caller that only sees None will report the second when it means the first. This
+    separates them, at the cost of one more `pactl` call on a path that has already
+    failed.
+    """
+    try:
+        _pactl("info")
+    except PulseError as exc:
+        return str(exc)
+    return None
+
+
 def list_monitors() -> list[str]:
     """Every monitor source PulseAudio/PipeWire knows about."""
     try:
