@@ -61,11 +61,20 @@ def _probe_asr(context: AppContext) -> BackendStatus:
                 headers["Authorization"] = f"Bearer {token}"
             if client.get(f"{url}/health").status_code != 200:
                 return BackendStatus("无响应", f"{url} 未回应健康检查", "danger")
-            ready = client.get(f"{url}/readyz", headers=headers)
-        loaded = ready.json().get("loaded", {}) if ready.status_code in (200, 503) else {}
-        model = loaded.get("asr")
+            try:
+                ready = client.get(f"{url}/readyz", headers=headers)
+            except httpx.TimeoutException:
+                # Alive (it just answered /health) but not answering readiness: a node
+                # from before readiness stopped waiting on the load lock does exactly
+                # this for the 25-40 s of a load. Red here showed a failure for a load
+                # that was succeeding.
+                return BackendStatus("加载中", f"{url} · 节点正忙，多半在加载模型", "active")
+        body = ready.json() if ready.status_code in (200, 503) else {}
+        model = body.get("loaded", {}).get("asr")
         if model:
             return BackendStatus("就绪", f"{url} · {model} 已驻留", "success")
+        if "asr" in body.get("loading", []):
+            return BackendStatus("加载中", f"{url} · 正在加载识别模型", "active")
         # 503 here is not a fault: the node loads on demand and simply has not been
         # asked yet. Saying "will load on first use" beats a red light on a good node.
         return BackendStatus("待命", f"{url} · 首次识别时加载模型", "active")
@@ -217,14 +226,27 @@ class _ProbeThread(QThread):
     three seconds of frozen interface is worse than a stale label."""
 
     done = Signal(object, object)
+    stage = Signal(str)
+    """Which backend is being asked right now. A probe can take seconds — a node that
+    has gone away answers by timing out — and a button that just goes grey for that long
+    says nothing about what it is waiting for."""
 
     def __init__(self, context: AppContext) -> None:
         super().__init__()
         self._context = context
 
     def run(self) -> None:
+        context = self._context
         try:
-            self.done.emit(_probe_asr(self._context), _probe_refiner(self._context))
+            self.stage.emit(f"正在检查语音识别：{context.node_url or '本机引擎'}…")
+            asr = _probe_asr(context)
+            refiner_target = (
+                context.settings.refiner_url
+                or ("本机整理服务" if context.refiner_managed else context.node_url)
+                or "未配置"
+            )
+            self.stage.emit(f"正在检查文本整理：{refiner_target}…")
+            self.done.emit(asr, _probe_refiner(context))
         except Exception as exc:  # noqa: BLE001 - a status panel must not kill the host
             failed = BackendStatus("检查失败", str(exc), "danger")
             self.done.emit(failed, failed)
@@ -240,7 +262,10 @@ class BackendPanel(QFrame):
         super().__init__(parent)
         self.context = context
         self._probe: _ProbeThread | None = None
-        self._release_thread: QThread | None = None
+        # One per backend, not one for the panel. A single slot meant an Orin load held
+        # the refiner's buttons for its whole 25-40 s, though the two share nothing.
+        self._node_thread: QThread | None = None
+        self._refiner_thread: QThread | None = None
         self._import_thread: _ImportThread | None = None
         self.setObjectName("card")
 
@@ -264,7 +289,10 @@ class BackendPanel(QFrame):
             detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
         self.refresh_button = QPushButton("重新检查")
-        self.refresh_button.clicked.connect(self.refresh)
+        self.refresh_button.clicked.connect(self._manual_refresh)
+        self._manual = False
+        """Whether the user asked for the check in flight. Only then is its progress
+        narrated: the periodic poll every 20 s would otherwise flicker the status line."""
         # Unloading acts on the recognition node, because that is the only model this
         # machine can reach an API for. The refiner is a plain llama-server with no
         # release endpoint — stopping it is a service operation, not a button here.
@@ -285,11 +313,9 @@ class BackendPanel(QFrame):
         self.refiner_unload_button = QPushButton("卸载")
         self.refiner_load_button.clicked.connect(lambda: self._refiner_action("load"))
         self.refiner_unload_button.clicked.connect(lambda: self._refiner_action("release"))
-        if not context.refiner_managed:
-            # Disabled until the first probe says otherwise. Whether an external server
-            # can be driven from here is an HTTP question, and asking it in a
-            # constructor would block the window from appearing.
-            self._set_refiner_controls(controllable=False)
+        # Refiner buttons start disabled unless we spawn the refiner ourselves: whether
+        # an external server can be driven from here is an HTTP question, answered by
+        # the first probe, and asking it in a constructor would block the window.
         # Import lands in this machine's catalog, which is where the refiner reads from.
         self.import_button = QPushButton("导入模型…")
         self.import_button.setToolTip(
@@ -321,6 +347,7 @@ class BackendPanel(QFrame):
         layout.addWidget(self.import_button, 2, 4)
         layout.setColumnStretch(2, 1)
 
+        self._update_controls()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.refresh)
         self._timer.start(POLL_SECONDS * 1000)
@@ -330,39 +357,75 @@ class BackendPanel(QFrame):
     def probing(self) -> bool:
         return self._probe is not None and self._probe.isRunning()
 
+    @staticmethod
+    def _running(thread: QThread | None) -> bool:
+        return thread is not None and thread.isRunning()
+
     @property
     def busy(self) -> bool:
-        return any(t is not None and t.isRunning() for t in (self._release, self._import))
+        threads = (self._node_thread, self._refiner_thread, self._import_thread)
+        return any(self._running(t) for t in threads)
+
+    def _update_controls(self) -> None:
+        """Every action button's enabled state, decided in one place.
+
+        A backend's buttons are off while its own action runs, and — only when both
+        backends share a machine — while the other's does too. Deciding this per call
+        site is how the periodic probe used to re-enable buttons under a running action.
+        """
+        shared = self.context.backends_share_host
+        node_busy = self._node_thread is not None
+        refiner_busy = self._refiner_thread is not None
+
+        asr_ok = bool(self.context.node_url) and not node_busy and not (shared and refiner_busy)
+        for button in (self.asr_load_button, self.release_button):
+            button.setEnabled(asr_ok)
+
+        controllable = self.context.refiner_controllable
+        refiner_ok = controllable and not refiner_busy and not (shared and node_busy)
+        for button in (self.refiner_load_button, self.refiner_unload_button):
+            button.setEnabled(refiner_ok)
+            button.setToolTip(
+                "加载整理模型到显存，或把显存还回去。"
+                if controllable
+                else "整理服务由外部管理（config.toml 设置了 refiner_url），"
+                "启停请用 systemctl 或启动它的方式。"
+            )
+        self.import_button.setEnabled(self._import_thread is None)
 
     def _node_action(self, action: str) -> None:
-        if self._release_thread is not None or not self.context.node_url:
+        if self._node_thread is not None or not self.context.node_url:
+            return
+        if self.context.backends_share_host and self._refiner_thread is not None:
             return
         if action == "release" and self.context.coordinator.active():
             # Evicting mid-recording fails the very request that is using the model.
             self._report("请先停止正在进行的识别或会议。")
             return
-        self._set_actions_enabled(False)
         self._report("正在加载识别模型，首次约需 25–40 秒…" if action == "load"
                      else "正在请求节点卸载模型…")
-        self._release_thread = _NodeActionThread(
+        self._node_thread = _NodeActionThread(
             self.context.node_url, self.context.settings.node_token, action
         )
-        self._release_thread.done.connect(self._report)
-        self._release_thread.finished.connect(self._action_finished)
-        self._release_thread.start()
+        self._node_thread.done.connect(self._report)
+        self._node_thread.finished.connect(lambda: self._action_finished("node"))
+        self._node_thread.start()
+        self._update_controls()
 
     def _refiner_action(self, action: str) -> None:
-        if self._release_thread is not None or not self.context.refiner_controllable:
+        if self._refiner_thread is not None or not self.context.refiner_controllable:
+            return
+        if self.context.backends_share_host and self._node_thread is not None:
             return
         if action == "release" and self.context.coordinator.active():
             self._report("请先停止正在进行的识别或会议。")
             return
-        self._set_actions_enabled(False)
         self._report("正在启动整理服务…" if action == "load" else "正在释放整理模型…")
-        self._release_thread = _RefinerActionThread(self.context, action)
-        self._release_thread.done.connect(self._report)
-        self._release_thread.finished.connect(self._action_finished)
-        self._release_thread.start()
+        self._refiner_thread = _RefinerActionThread(self.context, action)
+        self._refiner_thread.done.connect(self._report)
+        self._refiner_thread.finished.connect(lambda: self._action_finished("refiner"))
+        self._refiner_thread.start()
+        self._update_controls()
 
     def _import(self) -> None:
         if self._import_thread is not None:
@@ -423,7 +486,6 @@ class BackendPanel(QFrame):
             == QMessageBox.StandardButton.Yes
         )
 
-        self._set_actions_enabled(False)
         self._report("正在链接并校验模型文件…" if link else "正在复制并校验模型文件…")
         self._import_thread = _ImportThread(
             imported.ImportRequest(
@@ -434,35 +496,48 @@ class BackendPanel(QFrame):
             )
         )
         self._import_thread.done.connect(self._report)
-        self._import_thread.finished.connect(self._action_finished)
+        self._import_thread.finished.connect(lambda: self._action_finished("import"))
         self._import_thread.start()
+        self._update_controls()
 
     def _report(self, message: str) -> None:
         self.action_status.setText(message)
         self.action_status.setToolTip(message)
         self.action_status.show()
 
-    def _set_actions_enabled(self, enabled: bool) -> None:
-        for button in (self.asr_load_button, self.release_button, self.import_button):
-            button.setEnabled(enabled)
-        if self.context.refiner_controllable:
-            self.refiner_load_button.setEnabled(enabled)
-            self.refiner_unload_button.setEnabled(enabled)
-
-    def _action_finished(self) -> None:
-        self._release_thread = None
-        self._import_thread = None
-        self._set_actions_enabled(True)
+    def _action_finished(self, which: str) -> None:
+        # Only the thread that finished. Clearing every slot here let one backend's
+        # completion re-enable the other's buttons while its action was still running.
+        if which == "node":
+            self._node_thread = None
+        elif which == "refiner":
+            self._refiner_thread = None
+        else:
+            self._import_thread = None
+        self._update_controls()
         # Deferred, not immediate. A probe started here races the one already in flight
         # from the periodic timer, and `refresh` declines while that is running — so the
         # panel would keep showing the state from before the release.
         QTimer.singleShot(200, self.refresh)
+
+    def _manual_refresh(self) -> None:
+        self._manual = True
+        self.refresh_button.setText("检查中…")
+        self._report("正在检查语音识别和文本整理…")
+        # A periodic probe may already be running; `refresh` then declines, and that
+        # probe's own progress and result are what get reported.
+        self.refresh()
+
+    def _stage(self, message: str) -> None:
+        if self._manual:
+            self._report(message)
 
     def refresh(self) -> None:
         if self._probe is not None:
             return
         self.refresh_button.setEnabled(False)
         self._probe = _ProbeThread(self.context)
+        self._probe.stage.connect(self._stage)
         self._probe.done.connect(self._show)
         self._probe.finished.connect(self._finished)
         self._probe.start()
@@ -470,7 +545,10 @@ class BackendPanel(QFrame):
     def _show(self, asr: BackendStatus, refiner: BackendStatus) -> None:
         # The probe is what discovers an external server that can be driven from here,
         # so this is the first moment the buttons can be right.
-        self._set_refiner_controls(self.context.refiner_controllable)
+        self._update_controls()
+        if self._manual:
+            self._manual = False
+            self._report(f"检查完成：语音识别 {asr.label}，文本整理 {refiner.label}")
         # Broadcast for a collapsed header: folding setup away must not fold away the
         # answer to "is it working".
         self.summary.emit(f"识别 {asr.label} · 整理 {refiner.label}")
@@ -483,23 +561,9 @@ class BackendPanel(QFrame):
             detail.setText(status.detail)
             detail.setToolTip(status.detail)
 
-    def _set_refiner_controls(self, controllable: bool) -> None:
-        """Whether the refiner buttons do anything, and why not when they do not."""
-        if self._release_thread is not None:
-            # An action is in flight and owns these buttons. The periodic probe must not
-            # re-enable them under it.
-            return
-        for button in (self.refiner_load_button, self.refiner_unload_button):
-            button.setEnabled(controllable)
-            button.setToolTip(
-                "加载整理模型到显存，或把显存还回去。"
-                if controllable
-                else "整理服务由外部管理（config.toml 设置了 refiner_url），"
-                "启停请用 systemctl 或启动它的方式。"
-            )
-
     def _finished(self) -> None:
         self._probe = None
+        self.refresh_button.setText("重新检查")
         self.refresh_button.setEnabled(True)
 
     def wait_for_probe(self, timeout: int = 4000) -> None:
@@ -508,7 +572,7 @@ class BackendPanel(QFrame):
         A QThread destroyed while running takes the process with it, and the periodic
         probe means one is almost always in flight.
         """
-        for thread in (self._probe, self._release_thread, self._import_thread):
+        for thread in (self._probe, self._node_thread, self._refiner_thread, self._import_thread):
             if thread is not None and thread.isRunning():
                 thread.wait(timeout)
 

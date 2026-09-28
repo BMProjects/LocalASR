@@ -13,6 +13,7 @@ import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from localasr.apps.bus import EventBus
 from localasr.apps.coordinator import Activity, ActivityCoordinator
@@ -33,6 +34,12 @@ from localasr.registry.manager import ModelSpec
 
 if TYPE_CHECKING:
     from localasr.core.audio.vad import SileroVad, VadConfig
+
+
+def _host(url: str | None) -> str:
+    """Which machine a backend URL points at. No URL means this one."""
+    host = urlparse(url if url and "//" in url else f"//{url or ''}").hostname
+    return "local" if host in (None, "", "localhost", "127.0.0.1", "::1") else host
 
 
 DEFAULT_REFINER_MODEL = "localasr-refiner"
@@ -296,6 +303,18 @@ class AppContext:
             release_on_exit=self.settings.refiner_release_on_exit,
         )
         return self._lmstudio
+
+    @property
+    def backends_share_host(self) -> bool:
+        """Whether recognition and refinement run on the same machine.
+
+        Operating one while the other is loading only contends when they share memory:
+        on one host a load takes RAM or VRAM the other needs, and serialising the two
+        is what keeps a load from failing for want of memory the other is mid-way
+        through taking. On two hosts neither can affect the other, and locking the
+        refiner's buttons for the 25-40 s of an Orin load was waiting for nothing.
+        """
+        return _host(self.node_url) == _host(self.settings.refiner_url)
 
     @property
     def refiner_controllable(self) -> bool:

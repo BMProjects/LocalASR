@@ -1466,7 +1466,7 @@ def test_releasing_is_refused_while_a_workload_is_running(qt_app, monkeypatch):
     token = panel.context.coordinator.acquire(Activity.DICTATION)
     try:
         panel._node_action("release")
-        assert panel._release_thread is None, "must not have started"
+        assert panel._node_thread is None, "must not have started"
         assert "请先停止" in panel.action_status.text()
     finally:
         panel.context.coordinator.release(token)
@@ -1820,3 +1820,127 @@ def test_a_correction_says_what_it_did(qt_app):
     said = window.refine_status.text()
     assert "修正" in said and "对读" in said, said
     bridge.stop()
+
+
+def test_backends_on_different_hosts_do_not_block_each_other(qt_app, monkeypatch):
+    """An Orin load is 25-40 s. With the refiner on another machine there is nothing for
+    it to wait for, and it used to wait anyway."""
+    from PySide6.QtCore import QThread
+
+    panel, _ = _backend_panel(qt_app, monkeypatch)
+    panel.context.settings.refiner_url = None  # refiner spawned here, ASR on the node
+    assert not panel.context.backends_share_host
+
+    panel._node_thread = QThread()  # a load in flight on the node
+    panel._update_controls()
+    assert not panel.asr_load_button.isEnabled(), "its own buttons wait"
+    assert panel.refiner_load_button.isEnabled(), "the other machine's do not"
+
+
+def test_backends_on_one_host_are_serialised(qt_app, monkeypatch):
+    """On one machine a load takes memory the other needs; running both at once is how
+    one of them fails for memory the other is mid-way through taking."""
+    from PySide6.QtCore import QThread
+
+    panel, _ = _backend_panel(qt_app, monkeypatch)
+    panel.context.settings.node_url = "http://127.0.0.1:8090"
+    panel.context.settings.refiner_url = None
+    assert panel.context.backends_share_host
+
+    panel._node_thread = QThread()
+    panel._update_controls()
+    assert not panel.refiner_load_button.isEnabled()
+
+
+def test_one_action_finishing_does_not_free_the_others_buttons(qt_app, monkeypatch):
+    from PySide6.QtCore import QThread
+
+    panel, _ = _backend_panel(qt_app, monkeypatch)
+    panel.context.settings.refiner_url = None
+    panel._node_thread = QThread()
+    panel._refiner_thread = QThread()
+    panel._action_finished("refiner")
+
+    assert panel.refiner_load_button.isEnabled()
+    assert not panel.asr_load_button.isEnabled(), "the node's load is still running"
+
+
+def test_a_node_busy_loading_is_shown_as_loading_not_unreachable(monkeypatch):
+    """An older node blocks /readyz for the whole load; /health still answers."""
+    import httpx
+
+    from localasr.frontends.desktop import backend_panel as module
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        raise httpx.ReadTimeout("busy", request=request)
+
+    _route_httpx(monkeypatch, handler)
+    context = AppContext()
+    context.settings.node_url = "http://asr-node.local:8090"
+
+    status = module._probe_asr(context)
+    assert status.label == "加载中" and status.tone != "danger"
+
+
+def test_a_node_reporting_a_load_in_progress_is_shown_as_loading(monkeypatch):
+    import httpx
+
+    from localasr.frontends.desktop import backend_panel as module
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(503, json={"loaded": {}, "loading": ["asr"]})
+
+    _route_httpx(monkeypatch, handler)
+    context = AppContext()
+    context.settings.node_url = "http://asr-node.local:8090"
+
+    assert module._probe_asr(context).label == "加载中"
+
+
+def _route_httpx(monkeypatch, handler) -> None:  # noqa: ANN001
+    import httpx
+
+    original = httpx.Client.__init__
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        httpx.Client,
+        "__init__",
+        lambda self, *a, **k: original(self, *a, **{**k, "transport": transport}),
+    )
+
+
+def test_a_manual_recheck_says_what_it_is_checking_and_what_it_found(qt_app, monkeypatch):
+    """A check can take seconds — a node that has gone away answers by timing out — and
+    a button that only goes grey says nothing about what it is waiting for."""
+    panel, _ = _backend_panel(qt_app, monkeypatch)
+    qt_app.processEvents()
+    seen: list[str] = []
+    panel.action_status.setText = lambda text: seen.append(text)  # type: ignore[method-assign]
+
+    panel.refresh_button.click()
+    assert panel.refresh_button.text() == "检查中…"
+    panel.wait_for_probe()
+    qt_app.processEvents()
+
+    assert any("正在检查语音识别" in line and "asr-node.local" in line for line in seen)
+    assert any("正在检查文本整理" in line for line in seen)
+    assert seen[-1] == "检查完成：语音识别 就绪，文本整理 就绪"
+    assert panel.refresh_button.text() == "重新检查"
+
+
+def test_the_periodic_poll_does_not_narrate(qt_app, monkeypatch):
+    """Every 20 s; narrating it would flicker the status line for nothing asked."""
+    panel, _ = _backend_panel(qt_app, monkeypatch)
+    qt_app.processEvents()
+    seen: list[str] = []
+    panel.action_status.setText = lambda text: seen.append(text)  # type: ignore[method-assign]
+
+    panel.refresh()
+    panel.wait_for_probe()
+    qt_app.processEvents()
+
+    assert seen == []
