@@ -119,11 +119,31 @@ class ResourceCoordinator:
         self._lock = threading.RLock()
         self._servers: dict[ModelKind, EngineSupervisor] = {}
         self._specs: dict[ModelKind, ModelSpec] = {}
+        self._resident: dict[str, str] = {}
+        """What `loaded()` reports. Replaced whole, never mutated, so reading it needs
+        no lock — see `loaded()`."""
+        self._loading: frozenset[str] = frozenset()
 
     def loaded(self) -> dict[str, str]:
-        """Resident models keyed by role."""
-        with self._lock:
-            return {kind.value: spec.model_id for kind, spec in self._specs.items()}
+        """Resident models keyed by role. Never waits for a load in progress.
+
+        This used to take the same lock `ensure()` holds for the whole of a load — 25-40 s
+        on a Jetson — so `/readyz` hung for exactly the window in which somebody is most
+        likely to ask it. The desktop's three-second probe timed out, painted the node
+        red as unreachable, and turned green again when the load finished: a failure
+        shown for a load that was succeeding. Readers get the last published snapshot
+        instead; `loading()` says what is on its way.
+        """
+        return dict(self._resident)
+
+    def loading(self) -> list[str]:
+        """Roles whose load is in progress right now."""
+        return sorted(self._loading)
+
+    def _publish(self) -> None:
+        # Called with the lock held, after every change to `_specs`. Rebinding the
+        # attribute is atomic, so a reader sees either the old dict or the new one.
+        self._resident = {kind.value: spec.model_id for kind, spec in self._specs.items()}
 
     def ensure(self, spec: ModelSpec) -> str:
         """Make `spec` resident and return its base URL.
@@ -148,7 +168,11 @@ class ResourceCoordinator:
             # not fit, refusing and saying what is holding the memory leaves them able
             # to choose.
             self._check_headroom(spec)
-            return self._launch(spec)
+            self._loading = self._loading | {spec.kind.value}
+            try:
+                return self._launch(spec)
+            finally:
+                self._loading = self._loading - {spec.kind.value}
 
     def release(self, kind: ModelKind) -> None:
         with self._lock:
@@ -168,6 +192,7 @@ class ResourceCoordinator:
         client.close()
         self._servers[spec.kind] = server
         self._specs[spec.kind] = spec
+        self._publish()
         return server.base_url
 
     def _joining_cost_mb(self, spec: ModelSpec) -> int:
@@ -183,6 +208,7 @@ class ResourceCoordinator:
     def _release(self, kind: ModelKind) -> None:
         server = self._servers.pop(kind, None)
         self._specs.pop(kind, None)
+        self._publish()
         if server is not None:
             server.stop()
 

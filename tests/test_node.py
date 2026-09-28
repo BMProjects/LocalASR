@@ -918,3 +918,41 @@ def test_doctor_still_wants_local_weights_when_there_is_no_node(monkeypatch) -> 
     check = doctor._recognition_check(("dictate",))
     assert not check.ok
     assert "models pull" in check.detail
+
+
+def test_readiness_does_not_wait_for_a_load_in_progress(monkeypatch) -> None:  # noqa: ANN001
+    """`loaded()` used to take the lock `ensure()` holds for the whole 25-40 s of a load.
+    `/readyz` hung, the desktop's 3 s probe timed out and painted the node red as
+    unreachable, then green when the load finished: a failure shown for a success."""
+    import threading
+    import time
+
+    from localasr.registry import manager
+
+    coordinator = ResourceCoordinator(min_free_mb=0)
+    started, release = threading.Event(), threading.Event()
+
+    def slow_launch(spec):  # noqa: ANN001, ANN202
+        started.set()
+        release.wait(5)
+        coordinator._servers[spec.kind] = object()
+        coordinator._specs[spec.kind] = spec
+        coordinator._publish()
+        return "http://127.0.0.1:1"
+
+    monkeypatch.setattr(coordinator, "_launch", slow_launch)
+    monkeypatch.setattr(coordinator, "_check_headroom", lambda _spec: None)
+    spec = manager.get_model(kind=ModelKind.ASR)
+    loader = threading.Thread(target=coordinator.ensure, args=(spec,))
+    loader.start()
+    started.wait(5)
+
+    began = time.monotonic()
+    assert coordinator.loaded() == {}
+    assert coordinator.loading() == ["asr"], "and it says what is on its way"
+    assert time.monotonic() - began < 0.5, "readiness must answer during a load"
+
+    release.set()
+    loader.join(5)
+    assert coordinator.loaded() == {"asr": spec.model_id}
+    assert coordinator.loading() == []

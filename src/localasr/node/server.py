@@ -137,6 +137,7 @@ def create_app(config: NodeConfig | None = None) -> FastAPI:
         loaded = coordinator.loaded()
         body = {
             "loaded": loaded,
+            "loading": coordinator.loading(),
             "memory_mb": (
                 {"total": memory.total_mb, "available": memory.available_mb}
                 if memory
