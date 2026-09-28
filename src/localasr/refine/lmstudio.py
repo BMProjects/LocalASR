@@ -28,10 +28,12 @@ Docs: https://lmstudio.ai/docs/api/rest-api (load, unload, list). Default port 1
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,10 +57,29 @@ PROBE_TIMEOUT = 3.0
 LOAD_TIMEOUT = 300.0
 """A cold load reads several gigabytes off disk before it answers."""
 
+SERVER_SETTLE = 3.0
+"""How long to give `autoStartOnLaunch` to bring the server up with the daemon before
+concluding it will not, and starting it ourselves."""
+
 SERVICE_TIMEOUT = 120.0
 """`lms daemon up` waits ~60 s on its own before giving up."""
 
 LOOPBACK = ("127.0.0.1", "localhost", "::1", "")
+
+LOAD_CONFIG = {"context_length": 4096, "parallel": 1, "eval_batch_size": 512}
+"""What the refiner is loaded with, instead of LM Studio's per-model defaults.
+
+Those defaults are 8192 context x 4 parallel slots x 2048-token batches, and on a 4 GB
+card they leave ~280 MiB for everything else. Loading succeeds, then the first prompt's
+matmul needs more than that: CUDA OOM, the engine process dies, the request comes back
+400, the model is gone, and the next load does it all again. Measured on the RTX 3050:
+3790 MiB with the defaults, 3484 MiB with these, and a 750-character refinement that
+crashed before now runs in 4.3 s.
+
+4096 is what `refine.client` budgets for (DEFAULT_CONTEXT); a dictation client sends one
+request at a time, so one slot. `parallel` is not in the documented load schema but is
+honoured — `echo_load_config` reports it back.
+"""
 
 
 class LMStudioError(RuntimeError):
@@ -162,7 +183,7 @@ class LMStudioCompanion:
     """The model key, e.g. ``unsloth/Qwen3.5-4B-MTP-GGUF``. When unset, the one LLM this
     LM Studio has is not a guess; several are ambiguous and say so."""
 
-    context_length: int | None = None
+    load_config: dict[str, int] = field(default_factory=lambda: dict(LOAD_CONFIG))
     autostart: bool = True
     """Bring the server up with `lms` when it is not answering.
 
@@ -194,6 +215,11 @@ class LMStudioCompanion:
     """Whether *we* started llmster itself. Same rule one layer down, and it matters
     more here: `lms daemon down` ends every client's session, not just ours."""
 
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    """`start` and `stop` run on worker threads — the startup thread, the panel's
+    button — and two concurrent starts meant two loads racing, one of which restarted
+    the server under the other's in-flight request."""
+
     def __post_init__(self) -> None:
         self.url = self.url.rstrip("/")
 
@@ -213,6 +239,26 @@ class LMStudioCompanion:
     def catalog(self) -> list[dict]:
         """Every model LM Studio has downloaded, LLMs and embedding models alike."""
         return self._get("/api/v1/models").get("models", [])
+
+    def instances(self) -> dict[str, dict]:
+        """Loaded instance id → the config it was loaded with."""
+        return {
+            instance["id"]: instance.get("config") or {}
+            for entry in self.catalog()
+            for instance in entry.get("loaded_instances", [])
+            if "id" in instance
+        }
+
+    def fits(self, config: dict) -> bool:
+        """Whether an instance loaded with `config` is no heavier than ours.
+
+        Anything larger is the configuration that runs out of memory on the first
+        prompt, so adopting it only postpones the failure to the moment the user asks
+        for a refinement.
+        """
+        return all(
+            config.get(name, 0) <= limit for name, limit in self.load_config.items()
+        )
 
     def resident(self) -> tuple[str, ...]:
         """Instance ids currently loaded. Empty is the normal state before a session."""
@@ -245,6 +291,10 @@ class LMStudioCompanion:
 
         Returns what happened, in words the status panel can show.
         """
+        with self._lock:
+            return self._start()
+
+    def _start(self) -> str:
         if not self.answers():
             if not (self.autostart and startable_here(self.url)):
                 raise LMStudioError(
@@ -253,15 +303,19 @@ class LMStudioCompanion:
                 )
             self._start_server()
         key = self.key()
-        if key in self.resident():
-            # Found it warm. Adopted, not loaded: whether it is ours to unload afterwards
-            # is what `release_on_exit` answers.
-            self._instance = key
-            return f"{key}（LM Studio 上已加载）"
+        loaded = self.instances()
+        if key in loaded:
+            if self.fits(loaded[key]) or not self.release_on_exit:
+                # Found it warm. Adopted, not loaded: whether it is ours to unload
+                # afterwards is what `release_on_exit` answers.
+                self._instance = key
+                return f"{key}（LM Studio 上已加载）"
+            # Loaded with LM Studio's defaults — by its own JIT, by hand, by an older
+            # version of this module. That is the instance that dies on the first
+            # prompt, so it is replaced rather than adopted.
+            self._unload(key)
 
-        body: dict[str, object] = {"model": key}
-        if self.context_length:
-            body["context_length"] = self.context_length
+        body: dict[str, object] = {"model": key, **self.load_config}
         try:
             with httpx.Client(timeout=LOAD_TIMEOUT) as client:
                 response = client.post(
@@ -280,20 +334,25 @@ class LMStudioCompanion:
 
     def stop(self) -> None:
         """Unload, so the card is not still holding a refiner after the window closes."""
+        with self._lock:
+            self._stop()
+
+    def _unload(self, instance: str) -> None:
+        with httpx.Client(timeout=LOAD_TIMEOUT) as client:
+            client.post(
+                f"{self.url}/api/v1/models/unload",
+                json={"instance_id": instance},
+                headers=_headers(self.token),
+            )
+
+    def _stop(self) -> None:
         instance, loaded = self._instance, self._loaded
         self._instance, self._loaded = None, False
         if instance is not None and (self.release_on_exit or loaded):
-            try:
-                with httpx.Client(timeout=LOAD_TIMEOUT) as client:
-                    client.post(
-                        f"{self.url}/api/v1/models/unload",
-                        json={"instance_id": instance},
-                        headers=_headers(self.token),
-                    )
-            except httpx.HTTPError:
-                # Unreachable at exit means its memory is its own problem now. Raising
-                # here would only stop the application from closing.
-                pass
+            # Unreachable at exit means its memory is its own problem now. Raising here
+            # would only stop the application from closing.
+            with contextlib.suppress(httpx.HTTPError):
+                self._unload(instance)
         if self._started_server:
             self._started_server = False
             self._run_cli("server", "stop", check=False)
@@ -337,17 +396,30 @@ class LMStudioCompanion:
 
         Separate from the daemon because the two have different owners: llmster may
         already be somebody else's, while the front end is cheap to start and stop.
-        `lms server start` is a no-op when `autoStartOnLaunch` already brought it up with
-        the daemon, which is the common case and costs nothing.
+
+        Asked first, and only started if silent. `lms server start` against a running
+        server is not a no-op, as this once assumed: it stops and restarts it, and a load
+        in flight at that moment dies with "Model load request cancelled by client
+        disconnect" — observed at startup, where `autoStartOnLaunch` has usually brought
+        the server up with the daemon a moment earlier.
         """
+        if self._wait_until_answering(SERVER_SETTLE):
+            return
         self._run_cli("server", "start")
         self._started_server = True
-        end = time.monotonic() + SERVICE_TIMEOUT
-        while time.monotonic() < end:
+        if not self._wait_until_answering(SERVICE_TIMEOUT):
+            raise LMStudioError(
+                f"lms 已执行，但 {self.url} 在 {SERVICE_TIMEOUT:.0f}s 内没有就绪"
+            )
+
+    def _wait_until_answering(self, seconds: float) -> bool:
+        end = time.monotonic() + seconds
+        while True:
             if self.answers():
-                return
-            time.sleep(1.0)
-        raise LMStudioError(f"lms 已执行，但 {self.url} 在 {SERVICE_TIMEOUT:.0f}s 内没有就绪")
+                return True
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.5)
 
     def _run_cli(self, *args: str, check: bool = True) -> None:
         cli = find_cli()

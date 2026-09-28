@@ -88,6 +88,7 @@ def _no_real_cli(monkeypatch):  # noqa: ANN001, ANN201
     from localasr.refine import lmstudio
 
     monkeypatch.setattr(lmstudio, "find_cli", lambda: None)
+    monkeypatch.setattr(lmstudio, "SERVER_SETTLE", 0.0)
 
 
 @pytest.fixture
@@ -173,7 +174,7 @@ class TestSession:
     def test_a_session_loads_the_model_and_unloads_it(self, lms) -> None:  # noqa: ANN001
         companion = LMStudioCompanion(URL)
         companion.start()
-        assert lms.loads == [{"model": "unsloth/Qwen3.5-4B-MTP-GGUF"}]
+        assert [load["model"] for load in lms.loads] == ["unsloth/Qwen3.5-4B-MTP-GGUF"]
 
         companion.stop()
         assert lms.unloads == [{"instance_id": "unsloth/Qwen3.5-4B-MTP-GGUF"}]
@@ -243,7 +244,7 @@ class TestWhichModel:
         companion = LMStudioCompanion(URL, model="openai/gpt-oss-20b")
         companion.start()
 
-        assert lms.loads == [{"model": "openai/gpt-oss-20b"}]
+        assert [load["model"] for load in lms.loads] == ["openai/gpt-oss-20b"]
 
     def test_no_llm_at_all_says_what_to_do(self, lms) -> None:  # noqa: ANN001
         lms.models = []
@@ -270,9 +271,15 @@ class TestFailures:
             LMStudioCompanion(URL).start()
 
 
-def test_a_context_length_is_sent_only_when_asked_for(lms) -> None:  # noqa: ANN001
-    LMStudioCompanion(URL, context_length=8192).start()
-    assert lms.loads == [{"model": "unsloth/Qwen3.5-4B-MTP-GGUF", "context_length": 8192}]
+def test_the_load_carries_a_config_that_fits_a_4_gb_card(lms) -> None:  # noqa: ANN001
+    """LM Studio's defaults — 8192 x 4 slots x 2048-token batches — load, then die on the
+    first prompt with CUDA OOM, and the request comes back 400. Measured: 3790 MiB with
+    them, 3484 with these, and the prompt that crashed now completes."""
+    LMStudioCompanion(URL).start()
+    (load,) = lms.loads
+    assert load["context_length"] == 4096, "what refine.client budgets for"
+    assert load["parallel"] == 1, "one dictation, one request at a time"
+    assert load["eval_batch_size"] == 512
 
 
 class TestThroughTheApplication:
@@ -320,7 +327,7 @@ class TestThroughTheApplication:
         context = self._context()
         context.lmstudio()
         context.start_refiner()
-        assert lms.loads == [{"model": "unsloth/Qwen3.5-4B-MTP-GGUF"}]
+        assert [load["model"] for load in lms.loads] == ["unsloth/Qwen3.5-4B-MTP-GGUF"]
         assert context.refiner_loaded
 
         context.stop_refiner()
@@ -341,7 +348,7 @@ class TestThroughTheApplication:
         context = self._context(refiner_model="openai/gpt-oss-20b")
         context.start_refiner()
 
-        assert lms.loads == [{"model": "openai/gpt-oss-20b"}]
+        assert [load["model"] for load in lms.loads] == ["openai/gpt-oss-20b"]
 
     def test_the_default_model_name_is_not_mistaken_for_a_key(self, lms) -> None:  # noqa: ANN001
         """`refiner_model` defaults to "localasr-refiner", which is a label llama-server
@@ -350,7 +357,7 @@ class TestThroughTheApplication:
         context = self._context()
         context.start_refiner()
 
-        assert lms.loads == [{"model": "unsloth/Qwen3.5-4B-MTP-GGUF"}]
+        assert [load["model"] for load in lms.loads] == ["unsloth/Qwen3.5-4B-MTP-GGUF"]
 
     def test_release_on_exit_is_configurable(self, lms) -> None:  # noqa: ANN001
         lms.models[0]["loaded_instances"] = [{"id": "unsloth/Qwen3.5-4B-MTP-GGUF"}]
@@ -473,7 +480,7 @@ class TestWhoCanBeStarted:
     def test_a_remote_url_is_not_ours_to_start(self, cli) -> None:  # noqa: ANN001
         from localasr.refine.lmstudio import startable_here
 
-        assert not startable_here("http://192.168.2.206:1234"), "lms starts it here, not there"
+        assert not startable_here("http://asr-node.local:1234"), "lms starts it here, not there"
 
     def test_a_different_port_is_not_the_server_lms_would_start(self, cli, monkeypatch) -> None:  # noqa: ANN001
         """A down llama-server on 8091 must not get a button that brings up LM Studio on
@@ -674,3 +681,62 @@ class TestTheDaemonItself:
         from localasr.refine.lmstudio import daemon_running
 
         assert daemon_running() is None
+
+
+class TestAnInstanceThatWillNotFit:
+    """The 400 loop: an instance loaded with LM Studio's defaults, adopted as warm."""
+
+    HEAVY = {"context_length": 8192, "parallel": 4, "eval_batch_size": 2048}
+
+    def _resident(self, lms, config) -> None:  # noqa: ANN001
+        lms.models[0]["loaded_instances"] = [
+            {"id": "unsloth/Qwen3.5-4B-MTP-GGUF", "config": config}
+        ]
+
+    def test_an_oversized_instance_is_replaced_not_adopted(self, lms) -> None:  # noqa: ANN001
+        """Adopting it only postponed the OOM to the user's first refinement."""
+        self._resident(lms, self.HEAVY)
+        LMStudioCompanion(URL).start()
+
+        assert lms.unloads == [{"instance_id": "unsloth/Qwen3.5-4B-MTP-GGUF"}]
+        assert lms.loads[0]["parallel"] == 1
+
+    def test_an_instance_that_fits_is_adopted(self, lms) -> None:  # noqa: ANN001
+        self._resident(lms, {"context_length": 4096, "parallel": 1, "eval_batch_size": 512})
+        assert "已加载" in LMStudioCompanion(URL).start()
+        assert lms.loads == [] and lms.unloads == []
+
+    def test_somebody_elses_instance_is_left_alone_when_told_to(self, lms) -> None:  # noqa: ANN001
+        self._resident(lms, self.HEAVY)
+        LMStudioCompanion(URL, release_on_exit=False).start()
+        assert lms.loads == [] and lms.unloads == []
+
+
+def test_a_server_that_came_up_with_the_daemon_is_not_restarted(lms, cli, monkeypatch) -> None:  # noqa: ANN001
+    """`lms server start` on a running server stops and restarts it, cancelling any load
+    in flight — "Model load request cancelled by client disconnect" in LM Studio's log."""
+    from localasr.refine import lmstudio
+
+    monkeypatch.setattr(lmstudio, "startable_here", lambda _url: True)
+    # Silent until the daemon is up; autoStartOnLaunch brings the server with it.
+    monkeypatch.setattr(
+        lmstudio.LMStudioCompanion, "answers", lambda _self: ["daemon", "up"] in cli
+    )
+    lmstudio.LMStudioCompanion(URL).start()
+
+    assert ["server", "start"] not in cli
+
+
+def test_concurrent_starts_load_once(lms) -> None:  # noqa: ANN001
+    """The startup thread and the 启动 button can both be in `start`. Two loads racing is
+    two instances on a card that holds one."""
+    import threading
+
+    companion = LMStudioCompanion(URL)
+    threads = [threading.Thread(target=companion.start) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(lms.loads) == 1

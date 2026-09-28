@@ -299,11 +299,32 @@ Measured afterwards, no GUI anywhere:
 
     lms daemon up                    2.3 s      llmster v0.0.23+1
     lms daemon down                  0.2 s
-    lms server start                 ~1 s       port 1234 (a no-op when
-                                                autoStartOnLaunch already did it)
+    lms server start                 ~1 s       port 1234
     model load, cold                 3.4 s      qwen3.5-4b-mtp
     refinement, warm                 2.4 s      到出 -> 导出
     unload on exit                   0.5 s      3734 MiB -> 14 MiB
+
+`lms server start` against a server that is already running is **not** a no-op, as an
+earlier version of this document said: it stops and restarts it, and a model load in
+flight at that moment dies with "Model load request cancelled by client disconnect". With
+`autoStartOnLaunch` on, `lms daemon up` has usually brought the server up already, so the
+module waits a few seconds for it to answer and runs `server start` only if it stays
+silent.
+
+**The load config is not LM Studio's default.** Its per-model defaults for this model are
+8192 context × 4 parallel slots × 2048-token batches. On the 3050 they leave ~280 MiB
+free, the load reports success, and the first prompt's prefill runs out of CUDA memory:
+the engine process dies, the chat request comes back 400, the model is gone, and the
+next load repeats it. The module loads with
+
+    {"context_length": 4096, "parallel": 1, "eval_batch_size": 512}
+
+— 4096 is what `refine.client` budgets for, and dictation sends one request at a time
+(`parallel` is honoured though not in the documented schema; `echo_load_config` reports
+it). Measured: 3790 MiB → 3484 MiB, and refinements of 50, 750 and 1500 characters all
+complete. An instance already resident with a heavier config — JIT-loaded by LM Studio,
+or loaded by hand — is replaced rather than adopted, unless `refiner_release_on_exit` is
+off, in which case it is somebody else's and is left alone.
 
 If llmster is absent the error says so and names both fixes — installing it, or opening
 the desktop app and letting its `autoStartOnLaunch` bring the server up. A bare
